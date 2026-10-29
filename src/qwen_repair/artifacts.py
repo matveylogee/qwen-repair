@@ -54,4 +54,8 @@ def read_run(directory: Path) -> tuple[list[Trajectory], list[PrivateEvaluation]
     evaluations = read_jsonl(directory / "private_evaluation.jsonl", PrivateEvaluation)
     if any(item.run_id != manifest.run_id for item in [*trajectories, *evaluations]):
         raise ValueError("Record run ID differs from manifest")
+    if any(item.token_count_method != manifest.token_count_method for item in trajectories):
+        raise ValueError("Record token counting method differs from manifest")
+    if manifest.synthetic_demo != any(item.synthetic_demo for item in [*trajectories, *evaluations]):
+        raise ValueError("Record synthetic status differs from manifest")
     return trajectories, evaluations

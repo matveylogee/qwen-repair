@@ -1,4 +1,5 @@
 .venv/
+.venv-*/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -8,6 +9,8 @@ build/
 dist/
 /runs/
 /data/
+/queue/
+/artifacts/
 weights/
 checkpoints/
 *.safetensors

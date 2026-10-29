@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SCHEMA_VERSION = "1.0"
 TOKEN_COUNT_METHOD = "utf8_bytes_proxy"
+TokenCountMethod = Literal["utf8_bytes_proxy", "tokenizer"]
 
 
 class VersionedModel(BaseModel):
@@ -75,6 +76,25 @@ class Generation(BaseModel):
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     policy_version: str
+    prompt_token_ids: list[int] | None = None
+    completion_token_ids: list[int] | None = None
+    token_count_method: TokenCountMethod = TOKEN_COUNT_METHOD
+    duration_seconds: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    synthetic_demo: bool = True
+
+    @model_validator(mode="after")
+    def validate_token_ids(self) -> "Generation":
+        _validate_token_ids(self.prompt_token_ids, self.completion_token_ids,
+                            self.input_tokens, self.output_tokens, self.token_count_method)
+        return self
+
+
+def _validate_token_ids(prompt_ids, completion_ids, input_count, output_count, method):
+    if method == "tokenizer" and (prompt_ids is None or completion_ids is None):
+        raise ValueError("Tokenizer counts require exact prompt and completion token IDs")
+    for ids, count in ((prompt_ids, input_count), (completion_ids, output_count)):
+        if ids is not None and (len(ids) != count or any(token < 0 for token in ids)):
+            raise ValueError("Token IDs must be nonnegative and match the recorded counts")
 
 
 class TestResult(VersionedModel):
@@ -89,7 +109,7 @@ class TestResult(VersionedModel):
     tests_total: int = Field(default=0, ge=0)
     feedback: str = ""
     duration_seconds: float = Field(default=0.0, ge=0, allow_inf_nan=False)
-    synthetic_demo: Literal[True] = True
+    synthetic_demo: bool = True
 
     @model_validator(mode="after")
     def validate_counts(self) -> "TestResult":
@@ -118,9 +138,15 @@ class Attempt(VersionedModel):
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     duration_seconds: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    prompt_token_ids: list[int] | None = None
+    completion_token_ids: list[int] | None = None
+    token_count_method: TokenCountMethod = TOKEN_COUNT_METHOD
+    generation_duration_seconds: float = Field(default=0.0, ge=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def validate_candidate_state(self) -> "Attempt":
+        _validate_token_ids(self.prompt_token_ids, self.completion_token_ids,
+                            self.input_tokens, self.output_tokens, self.token_count_method)
         if self.parse_error is not None:
             if not self.parse_error.strip():
                 raise ValueError("A parse error must have a nonempty reason")
@@ -141,11 +167,18 @@ class Trajectory(VersionedModel):
     max_attempts: int = Field(ge=1)
     attempts: list[Attempt]
     stop_reason: Literal["budget_exhausted", "infra_error", "context_budget_exceeded"]
-    token_count_method: Literal["utf8_bytes_proxy"] = TOKEN_COUNT_METHOD
-    synthetic_demo: Literal[True] = True
+    token_count_method: TokenCountMethod = TOKEN_COUNT_METHOD
+    synthetic_demo: bool = True
 
     @model_validator(mode="after")
     def validate_attempt_order(self) -> "Trajectory":
+        if any(attempt.token_count_method != self.token_count_method for attempt in self.attempts):
+            raise ValueError("Attempt token counting methods must match the trajectory")
+        if not self.synthetic_demo and any(
+            attempt.public_result is not None and attempt.public_result.synthetic_demo
+            for attempt in self.attempts
+        ):
+            raise ValueError("A real trajectory cannot contain synthetic public results")
         if [attempt.number for attempt in self.attempts] != list(range(1, len(self.attempts) + 1)):
             raise ValueError("Attempts must be contiguous and start at one")
         if len(self.attempts) > self.max_attempts:
@@ -162,10 +195,12 @@ class PrivateEvaluation(VersionedModel):
     attempt_results: list[TestResult | None]
     terminal_reward: Literal[0, 1] | None
     excluded_reason: str | None = None
-    synthetic_demo: Literal[True] = True
+    synthetic_demo: bool = True
 
     @model_validator(mode="after")
     def validate_reward(self) -> "PrivateEvaluation":
+        if not self.synthetic_demo and any(result is not None and result.synthetic_demo for result in self.attempt_results):
+            raise ValueError("A real private evaluation cannot contain synthetic results")
         if self.excluded_reason is not None:
             if self.terminal_reward is not None:
                 raise ValueError("Excluded episodes cannot carry a reward")
@@ -180,7 +215,7 @@ class PrivateEvaluation(VersionedModel):
 class RunManifest(VersionedModel):
     run_id: str
     status: Literal["running", "completed", "completed_with_exclusions", "failed"]
-    synthetic_demo: Literal[True] = True
+    synthetic_demo: bool = True
     created_at: str
     completed_at: str | None = None
     package_version: str
@@ -191,10 +226,13 @@ class RunManifest(VersionedModel):
     policy_version: str
     prompt_version: str
     runner_version: str
-    token_count_method: Literal["utf8_bytes_proxy"] = TOKEN_COUNT_METHOD
-    model_revision: None = None
-    tokenizer_revision: None = None
+    token_count_method: TokenCountMethod = TOKEN_COUNT_METHOD
+    model_revision: str | None = None
+    tokenizer_revision: str | None = None
     fixture_hashes: dict[str, str]
     source_hashes: dict[str, str]
+    dataset_hashes: dict[str, str] = Field(default_factory=dict)
+    executor_config: dict = Field(default_factory=dict)
+    performance: dict = Field(default_factory=dict)
     artifact_hashes: dict[str, str] = Field(default_factory=dict)
     error_type: str | None = None

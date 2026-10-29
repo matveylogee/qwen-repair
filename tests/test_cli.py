@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -121,6 +122,21 @@ def test_existing_run_directory_is_preserved(demo_run):
     assert result.returncode != 0
     after = {path.name: path.read_bytes() for path in demo_run.iterdir() if path.is_file()}
     assert before == after
+
+
+@pytest.mark.parametrize("field,value", [("synthetic_demo", False), ("token_count_method", "tokenizer")])
+def test_summary_rejects_manifest_that_contradicts_events(demo_run, field, value):
+    manifest_path = demo_run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest[field] = value
+    manifest_path.write_text(json.dumps(manifest))
+    checksums_path = demo_run / "checksums.json"
+    checksums = json.loads(checksums_path.read_text())
+    checksums["files"]["manifest.json"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    checksums_path.write_text(json.dumps(checksums))
+    result = cli("summarize", "--run", demo_run)
+    assert result.returncode != 0
+    assert "differs from manifest" in result.stderr
 
 
 def test_same_seed_reproduces_meaningful_events(demo_run, tmp_path):

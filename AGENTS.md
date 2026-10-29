@@ -1,7 +1,11 @@
 # Project rules
 
-- Current scope is M0: a CPU-only synthetic repair demo. Training, model downloads,
-  dataset ingestion and real executors require a subsequent task.
+- Current scope is M1: bounded Colab feasibility with Qwen, LoRA SFT/GRPO smoke
+  tests, a small KodCode pilot and an isolated executor. Preserve the M0 demo.
+- GPU training, isolation and resume are verified only by actual runs. Never
+  label mocks, synthetic rewards or CPU contract tests as GPU validation.
+- Use pinned model/data revisions and a separate GPU dependency profile. Keep
+  smoke runs short; do not publish datasets or start paid/long training jobs.
 - Keep code in `src/qwen_repair`; notebooks only install and call the CLI.
 - Never execute candidate code on the host. The fake executor only looks up
   prepared results. AST parsing is validation, not a sandbox.

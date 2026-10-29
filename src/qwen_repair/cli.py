@@ -6,17 +6,21 @@ from pathlib import Path
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="qrepair", description="M0 synthetic CPU code-repair demo; no candidate code is executed."
+        prog="qrepair", description="Python repair: synthetic demo and bounded isolated M1 experiments."
     )
     commands = parser.add_subparsers(dest="command", required=True)
     doctor = commands.add_parser("doctor", help="Inspect CPU setup without importing GPU libraries")
     doctor.add_argument("--config", type=Path, help="Validate and report a demo YAML config")
+    doctor.add_argument("--gpu", action="store_true", help="Explicitly import and probe the pinned GPU stack")
+    doctor.add_argument("--output", type=Path, help="Write a new JSON environment report")
     demo = commands.add_parser("demo", help="Write a synthetic run bundle")
     demo.add_argument("--config", type=Path, required=True)
     demo.add_argument("--output", type=Path, required=True, help="New run directory (must not exist)")
     summary = commands.add_parser("summarize", help="Verify a saved run and recompute its metrics")
     summary.add_argument("--run", type=Path, required=True)
     summary.add_argument("--output", type=Path, help="Optional new JSON file outside the run bundle")
+    from qwen_repair.m1_cli import add_arguments
+    add_arguments(commands)
     return parser
 
 
@@ -114,11 +118,17 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "doctor":
-            config = load_config(args.config) if args.config else DemoConfig()
-            result = inspect_environment(config)
+            if args.gpu:
+                from qwen_repair.runtime import gpu_preflight
+                result = gpu_preflight()
+            else:
+                config = load_config(args.config) if args.config else DemoConfig()
+                result = inspect_environment(config)
+            from qwen_repair.m1_cli import _save_report
+            _save_report(args.output, result)
         elif args.command == "demo":
             result = run_demo(load_config(args.config), args.output)
-        else:
+        elif args.command == "summarize":
             trajectories, evaluations = read_run(args.run)
             result = summarize(trajectories, evaluations)
             if args.output:
@@ -126,13 +136,16 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError("Summary output must be outside the immutable run bundle")
                 with args.output.open("x", encoding="utf-8") as stream:
                     stream.write(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        else:
+            from qwen_repair.m1_cli import run_command
+            result = run_command(args)
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
+        return 1 if result.get("passed") is False else 0
     except ValidationError as error:
         for detail in error.errors(include_input=False, include_url=False):
             location = ".".join(str(part) for part in detail["loc"])
             print(f"qrepair: invalid {location}: {detail['msg']}", file=sys.stderr)
         return 2
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, RuntimeError, ImportError) as error:
         print(f"qrepair: {error}", file=sys.stderr)
         return 2

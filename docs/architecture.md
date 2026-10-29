@@ -44,6 +44,14 @@ TaskRecord -> PromptView -> EpisodeController -> ScriptedPolicy
 
 Manifest сохраняет параметры, seed и сведения о коде и среде; контрольные суммы позволяют проверять артефакты. Время и ID запуска могут различаться между повторами. Логика M0 находится в пакете; notebook содержит только установку и вызовы CLI.
 
+## Расширения M1
+
+`TransformersPolicy` использует закреплённые модель и tokenizer, non-thinking chat template и настоящий счётчик токенов. `TokenConversation` хранит исходные prompt/completion token IDs: при следующей попытке feedback добавляется к существующему префиксу. M0 сохраняет отдельный счётчик байтов.
+
+`DockerExecutor` запускает JSON-функцию в ограниченном контейнере, а сравнение с ожидаемым ответом выполняет доверенный supervisor. `FileQueueExecutor` передаёт запросы локальному Docker worker через папку с payload/checksum/READY и проверкой IDs, хешей, сроков и отмены. Успешный preflight обязателен; отсутствие Docker или worker не включает выполнение кандидатов на хосте.
+
+Inference сохраняет обычный run bundle с `synthetic_demo=false`. SFT и GRPO сохраняют training manifest, masks/rollouts, отдельную private evaluation и checkpoints с completion marker. SFT использует стандартный Transformers Trainer; GRPO использует стандартный TRL trainer с проверенным `env_mask`. Обучение ограничено smoke-профилем; большие эксперименты пока не запускаются.
+
 ## Ограничения
 
-M0 не исполняет недоверенный код и не проверяет Docker sandbox, Colab GPU, Qwen, SFT или GRPO. Реальный executor, токенизатор и обучение входят в M1. Существующие fake интерфейсы не дают гарантий изоляции или устойчивости будущего judge к подмене результата.
+M0 не исполняет недоверенный код. Локальные проверки M1 подтверждают ограниченный Docker-протокол и интеграцию trainer на маленькой CPU-модели; для полного feasibility нужны отдельные T4 и Colab-to-Mac прогоны. Fake-интерфейсы не дают гарантий изоляции. Глобальная дедупликация датасета, финальные research splits и оценка качества относятся к следующим этапам.

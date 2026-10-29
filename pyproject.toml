@@ -4,14 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qwen-repair"
-version = "0.1.0"
-description = "CPU synthetic prototype for multi-attempt Python code repair"
+version = "0.2.0"
+description = "Python code-repair harness and bounded Colab feasibility experiments"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["pydantic>=2,<3", "PyYAML>=6,<7"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]
+data = ["datasets==4.7.0"]
+gpu = [
+  "torch==2.10.0",
+  "transformers==5.20.2",
+  "peft==0.21.2",
+  "trl==1.16.0",
+  "accelerate==1.11.0",
+  "datasets==4.7.0",
+]
 
 [project.scripts]
 qrepair = "qwen_repair.cli:main"
@@ -25,3 +34,4 @@ qwen_repair = ["data/fixtures/*.json"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = ["ml: requires the optional pinned ML dependencies", "docker: requires Docker and a pinned executor image"]

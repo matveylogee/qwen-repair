@@ -29,6 +29,7 @@ def evaluate_private(
         attempt_results=results,
         terminal_reward=None if excluded else int(final_passed),
         excluded_reason=excluded,
+        synthetic_demo=trajectory.synthetic_demo or any(result is not None and result.synthetic_demo for result in results),
     )
 
 
@@ -49,6 +50,11 @@ def summarize(
         raise ValueError("Private evaluation and trajectory IDs must match exactly")
     if len({item.run_id for item in trajectories}) != 1:
         raise ValueError("Summarize one run at a time")
+    methods = {item.token_count_method for item in trajectories}
+    if len(methods) != 1:
+        raise ValueError("A run cannot mix byte counts and model token counts")
+    token_count_method = next(iter(methods))
+    synthetic_demo = any(item.synthetic_demo for item in [*trajectories, *evaluations])
 
     successes = []
     eligible_attempts = []
@@ -97,10 +103,10 @@ def summarize(
             sum(any(values[:index + 1]) for values in successes if len(values) > index), denominator
         )
     all_attempts = [attempt for item in trajectories for attempt in item.attempts]
-    return {
+    metrics = {
         "schema_version": "1.0",
-        "synthetic_demo": True,
-        "aggregation": "demo_episode",
+        "synthetic_demo": synthetic_demo,
+        "aggregation": "demo_episode" if synthetic_demo else "episode",
         "total_episodes": len(trajectories),
         "eligible_episodes": eligible,
         "excluded_episodes": len(trajectories) - eligible,
@@ -129,5 +135,13 @@ def summarize(
         ),
         "input_tokens": sum(attempt.input_tokens for attempt in all_attempts),
         "output_tokens": sum(attempt.output_tokens for attempt in all_attempts),
-        "token_count_method": "utf8_bytes_proxy",
+        "token_count_method": token_count_method,
     }
+    if token_count_method == "tokenizer":
+        generation_seconds = sum(attempt.generation_duration_seconds for attempt in all_attempts)
+        metrics.update({
+            "generation_seconds": generation_seconds,
+            "episode_seconds": sum(attempt.duration_seconds for attempt in all_attempts),
+            "output_tokens_per_second": metrics["output_tokens"] / generation_seconds if generation_seconds else None,
+        })
+    return metrics

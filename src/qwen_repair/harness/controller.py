@@ -51,12 +51,19 @@ class EpisodeController:
         scenario: str,
     ) -> Trajectory:
         messages = build_initial_messages(PromptView.from_task(task))
+        begin_episode = getattr(policy, "begin_episode", None)
+        if begin_episode is not None:
+            begin_episode()
         policy_version = policy.policy_version
+        token_count_method = getattr(policy, "token_count_method", "utf8_bytes_proxy")
+        count_messages = getattr(policy, "count_messages", count_message_tokens)
+        truncate_feedback = getattr(policy, "truncate_feedback", truncate_to_budget)
+        synthetic_demo = getattr(policy, "synthetic_demo", True) or getattr(executor, "synthetic_demo", True)
         attempts = []
         stop_reason = "budget_exhausted"
         generation_config = GenerationConfig(max_new_tokens=self.config.max_new_tokens)
         for number in range(1, self.config.max_attempts + 1):
-            input_tokens = count_message_tokens(messages)
+            input_tokens = count_messages(messages)
             if input_tokens + self.config.max_new_tokens > self.config.max_context_tokens:
                 stop_reason = "context_budget_exceeded"
                 break
@@ -64,9 +71,15 @@ class EpisodeController:
             generated = policy.generate(list(messages), generation_config)
             if generated.policy_version != policy_version or policy.policy_version != policy_version:
                 raise ValueError("Policy changed version within an episode")
-            output_tokens = count_tokens(generated.text)
+            if generated.token_count_method != token_count_method:
+                raise ValueError("Policy changed its token counting method")
+            output_tokens = (
+                len(generated.completion_token_ids)
+                if token_count_method == "tokenizer" else count_tokens(generated.text)
+            )
             if generated.input_tokens != input_tokens or generated.output_tokens != output_tokens:
-                raise ValueError("Policy counts must match the M0 UTF-8 byte budget")
+                raise ValueError("Policy counts must match the recorded token budget")
+            synthetic_demo = synthetic_demo or generated.synthetic_demo
             code = None
             parse_error = None
             result = None
@@ -76,15 +89,18 @@ class EpisodeController:
                 code = parse_candidate(generated.text, task.entry_point, task.signature)
             except CandidateError as error:
                 parse_error = error.code
-                feedback = format_parse_error(error, self.config.max_feedback_tokens)
+                raw_feedback = format_parse_error(error, 1024)
+                feedback = truncate_feedback(raw_feedback, self.config.max_feedback_tokens)
             else:
                 result = executor.run(code, task.public_tests_ref)
                 result = result.model_copy(update={
-                    "feedback": truncate_to_budget(
+                    "feedback": truncate_feedback(
                         sanitize_diagnostic(result.feedback), self.config.max_feedback_tokens
                     )
                 })
-                feedback = format_feedback(result, self.config.max_feedback_tokens)
+                raw_feedback = format_feedback(result, len(result.feedback.encode("utf-8")) + 128)
+                feedback = truncate_feedback(raw_feedback, self.config.max_feedback_tokens)
+                synthetic_demo = synthetic_demo or result.synthetic_demo
 
             attempts.append(Attempt(
                 number=number,
@@ -97,6 +113,10 @@ class EpisodeController:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 duration_seconds=perf_counter() - started,
+                prompt_token_ids=generated.prompt_token_ids,
+                completion_token_ids=generated.completion_token_ids,
+                token_count_method=token_count_method,
+                generation_duration_seconds=generated.duration_seconds,
             ))
             if result is not None and result.status == "infra_error":
                 stop_reason = "infra_error"
@@ -116,4 +136,6 @@ class EpisodeController:
             max_attempts=self.config.max_attempts,
             attempts=attempts,
             stop_reason=stop_reason,
+            token_count_method=token_count_method,
+            synthetic_demo=synthetic_demo,
         )

@@ -1,0 +1,6 @@
+backend: file_queue
+image: python@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
+queue_dir: /content/drive/MyDrive/qwen-repair-exchange
+deadline_seconds: 120.0
+poll_interval: 0.5
+timeout_seconds: 5.0
