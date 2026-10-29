@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "synthetic_demo": true,
+  "task": {
+    "schema_version": "1.0",
+    "task_id": "demo-count-even",
+    "source_id": "authored-count-even",
+    "group_id": "authored-count-even",
+    "split": "demo",
+    "statement": "Return how many integers in values are even. Zero and negative even integers count.",
+    "signature": "def count_even(values: list[int]) -> int:",
+    "entry_point": "count_even",
+    "buggy_code": "def count_even(values: list[int]) -> int:\n    return sum(1 for value in values if value % 2 != 0)",
+    "bug_type": "inverted_comparison",
+    "public_tests_ref": "count_even.public.v1",
+    "private_tests_ref": "count_even.private.v1",
+    "reference_ref": "count_even.reference.v1"
+  },
+  "reference_code": "# REFERENCE_SENTINEL_count_even\ndef count_even(values: list[int]) -> int:\n    return sum(1 for value in values if value % 2 == 0)",
+  "corrected_code": "def count_even(values: list[int]) -> int:\n    return sum(1 for value in values if value % 2 == 0)",
+  "public_cases": [
+    {"name": "mixed", "args": [[1, 2, 4]], "expected": 2},
+    {"name": "empty", "args": [[]], "expected": 0}
+  ],
+  "private_cases": [
+    {"name": "PRIVATE_SENTINEL_count_even_zero", "args": [[-2, 0, 3]], "expected": 2},
+    {"name": "PRIVATE_SENTINEL_count_even_single", "args": [[8]], "expected": 1}
+  ],
+  "outcomes": {
+    "buggy": {
+      "public": {"status": "failed", "tests_passed": 1, "tests_failed": 1, "tests_total": 2, "feedback": "count_even([1, 2, 4]): expected 2, got 1."},
+      "private": {"status": "failed", "tests_passed": 0, "tests_failed": 2, "tests_total": 2, "feedback": "PRIVATE_SENTINEL_count_even: counted odd integers."}
+    },
+    "corrected": {
+      "public": {"status": "passed", "tests_passed": 2, "tests_failed": 0, "tests_total": 2, "feedback": "Both public cases passed (synthetic)."},
+      "private": {"status": "passed", "tests_passed": 2, "tests_failed": 0, "tests_total": 2, "feedback": "PRIVATE_SENTINEL_count_even: both cases passed (synthetic)."}
+    }
+  }
+}

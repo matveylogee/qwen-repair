@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "synthetic_demo": true,
+  "task": {
+    "schema_version": "1.0",
+    "task_id": "demo-is-palindrome",
+    "source_id": "authored-is-palindrome",
+    "group_id": "authored-is-palindrome",
+    "split": "demo",
+    "statement": "Return whether text reads identically forward and backward. Compare characters exactly; the empty string is a palindrome.",
+    "signature": "def is_palindrome(text: str) -> bool:",
+    "entry_point": "is_palindrome",
+    "buggy_code": "def is_palindrome(text: str) -> bool:\n    return text == text[1:]",
+    "bug_type": "wrong_slice",
+    "public_tests_ref": "is_palindrome.public.v1",
+    "private_tests_ref": "is_palindrome.private.v1",
+    "reference_ref": "is_palindrome.reference.v1"
+  },
+  "reference_code": "# REFERENCE_SENTINEL_is_palindrome\ndef is_palindrome(text: str) -> bool:\n    return text == text[::-1]",
+  "corrected_code": "def is_palindrome(text: str) -> bool:\n    return text == text[::-1]",
+  "public_cases": [
+    {"name": "palindrome", "args": ["level"], "expected": true},
+    {"name": "not_palindrome", "args": ["ab"], "expected": false}
+  ],
+  "private_cases": [
+    {"name": "PRIVATE_SENTINEL_is_palindrome_empty", "args": [""], "expected": true},
+    {"name": "PRIVATE_SENTINEL_is_palindrome_single", "args": ["x"], "expected": true}
+  ],
+  "outcomes": {
+    "buggy": {
+      "public": {"status": "failed", "tests_passed": 1, "tests_failed": 1, "tests_total": 2, "feedback": "is_palindrome('level'): expected True, got False."},
+      "private": {"status": "failed", "tests_passed": 1, "tests_failed": 1, "tests_total": 2, "feedback": "PRIVATE_SENTINEL_is_palindrome: failed on a single character."}
+    },
+    "corrected": {
+      "public": {"status": "passed", "tests_passed": 2, "tests_failed": 0, "tests_total": 2, "feedback": "Both public cases passed (synthetic)."},
+      "private": {"status": "passed", "tests_passed": 2, "tests_failed": 0, "tests_total": 2, "feedback": "PRIVATE_SENTINEL_is_palindrome: both cases passed (synthetic)."}
+    }
+  }
+}

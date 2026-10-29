@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "synthetic_demo": true,
+  "task": {
+    "schema_version": "1.0",
+    "task_id": "demo-last-or-none",
+    "source_id": "authored-last-or-none",
+    "group_id": "authored-last-or-none",
+    "split": "demo",
+    "statement": "Return the final item of values, or None if the list is empty.",
+    "signature": "def last_or_none(values: list):",
+    "entry_point": "last_or_none",
+    "buggy_code": "def last_or_none(values: list):\n    return values[0] if values else None",
+    "bug_type": "wrong_index",
+    "public_tests_ref": "last_or_none.public.v1",
+    "private_tests_ref": "last_or_none.private.v1",
+    "reference_ref": "last_or_none.reference.v1"
+  },
+  "reference_code": "# REFERENCE_SENTINEL_last_or_none\ndef last_or_none(values: list):\n    return values[-1] if values else None",
+  "corrected_code": "def last_or_none(values: list):\n    return values[-1] if values else None",
+  "public_cases": [
+    {"name": "two_items", "args": [[2, 5]], "expected": 5},
+    {"name": "empty", "args": [[]], "expected": null}
+  ],
+  "private_cases": [
+    {"name": "PRIVATE_SENTINEL_last_or_none_strings", "args": [["a", "b"]], "expected": "b"},
+    {"name": "PRIVATE_SENTINEL_last_or_none_one_item", "args": [[7]], "expected": 7}
+  ],
+  "outcomes": {
+    "buggy": {
+      "public": {"status": "failed", "tests_passed": 1, "tests_failed": 1, "tests_total": 2, "feedback": "last_or_none([2, 5]): expected 5, got 2."},
+      "private": {"status": "failed", "tests_passed": 1, "tests_failed": 1, "tests_total": 2, "feedback": "PRIVATE_SENTINEL_last_or_none: returned the first item."}
+    },
+    "corrected": {
+      "public": {"status": "passed", "tests_passed": 2, "tests_failed": 0, "tests_total": 2, "feedback": "Both public cases passed (synthetic)."},
+      "private": {"status": "passed", "tests_passed": 2, "tests_failed": 0, "tests_total": 2, "feedback": "PRIVATE_SENTINEL_last_or_none: both cases passed (synthetic)."}
+    }
+  }
+}

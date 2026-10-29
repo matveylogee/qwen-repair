@@ -1,0 +1,12 @@
+schema_version: "1.0"
+seed: 42
+max_attempts: 2
+max_new_tokens: 512
+max_context_tokens: 4096
+max_feedback_tokens: 256
+scenarios:
+  - recovery
+  - invalid_format
+  - repeated_error
+  - infra_failure
+  - regression

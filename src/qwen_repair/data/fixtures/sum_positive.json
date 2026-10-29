@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "synthetic_demo": true,
+  "task": {
+    "schema_version": "1.0",
+    "task_id": "demo-sum-positive",
+    "source_id": "authored-sum-positive",
+    "group_id": "authored-sum-positive",
+    "split": "demo",
+    "statement": "Return the sum of strictly positive integers in values. Ignore zero and negative integers.",
+    "signature": "def sum_positive(values: list[int]) -> int:",
+    "entry_point": "sum_positive",
+    "buggy_code": "def sum_positive(values: list[int]) -> int:\n    return sum(values)",
+    "bug_type": "missing_filter",
+    "public_tests_ref": "sum_positive.public.v1",
+    "private_tests_ref": "sum_positive.private.v1",
+    "reference_ref": "sum_positive.reference.v1"
+  },
+  "reference_code": "# REFERENCE_SENTINEL_sum_positive\ndef sum_positive(values: list[int]) -> int:\n    return sum(value for value in values if value > 0)",
+  "corrected_code": "def sum_positive(values: list[int]) -> int:\n    return sum(value for value in values if value > 0)",
+  "public_cases": [
+    {"name": "mixed", "args": [[-2, 0, 3]], "expected": 3},
+    {"name": "positive", "args": [[1, 2]], "expected": 3}
+  ],
+  "private_cases": [
+    {"name": "PRIVATE_SENTINEL_sum_positive_negative", "args": [[-5]], "expected": 0},
+    {"name": "PRIVATE_SENTINEL_sum_positive_mixed", "args": [[3, -7, 5]], "expected": 8}
+  ],
+  "outcomes": {
+    "buggy": {
+      "public": {"status": "failed", "tests_passed": 1, "tests_failed": 1, "tests_total": 2, "feedback": "sum_positive([-2, 0, 3]): expected 3, got 1."},
+      "private": {"status": "failed", "tests_passed": 0, "tests_failed": 2, "tests_total": 2, "feedback": "PRIVATE_SENTINEL_sum_positive: negative terms were included."}
+    },
+    "corrected": {
+      "public": {"status": "passed", "tests_passed": 2, "tests_failed": 0, "tests_total": 2, "feedback": "Both public cases passed (synthetic)."},
+      "private": {"status": "passed", "tests_passed": 2, "tests_failed": 0, "tests_total": 2, "feedback": "PRIVATE_SENTINEL_sum_positive: both cases passed (synthetic)."}
+    }
+  }
+}
