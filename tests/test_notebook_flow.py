@@ -38,7 +38,15 @@ def notebook_harness(tmp_path, monkeypatch, *, inference=False, training=False, 
         assert kwargs.get("check") is True
         calls.append(command)
         if failed_command in command:
-            raise subprocess.CalledProcessError(1, command)
+            raise subprocess.CalledProcessError(1, command, output="setup diagnostic: subprocess failed\n")
+        if command[1:3] == ["-m", "venv"] and "--without-pip" not in command:
+            raise subprocess.CalledProcessError(1, command, output="ensurepip is unavailable\n")
+        if command[1:3] == ["-m", "pip"]:
+            assert command[0] == sys.executable
+            assert command[3:5] == ["--python", str(Path(namespace["ENV_DIR"]) / "bin/python")]
+            assert kwargs["stdout"] == subprocess.PIPE
+            assert kwargs["stderr"] == subprocess.STDOUT
+            assert kwargs["text"] is True
         if command[:2] == ["git", "clone"]:
             Path(command[-1]).mkdir()
         if "--output" in command:
@@ -70,6 +78,17 @@ def test_default_run_all_only_calls_cpu_and_transport_commands(tmp_path, monkeyp
     assert namespace["transport_ready"] is True
     assert namespace["gpu_ready"] is False
     assert len(downloads) == 1 and Path(downloads[0]).is_file()
+
+
+@pytest.mark.parametrize("failure", ["venv", "pip"])
+def test_setup_failure_shows_subprocess_output_and_stops(tmp_path, monkeypatch, capsys, failure):
+    cells, namespace, calls, _ = notebook_harness(tmp_path, monkeypatch, failed_command=failure)
+    with pytest.raises(subprocess.CalledProcessError):
+        run_cells(cells, namespace)
+    assert "setup diagnostic: subprocess failed" in capsys.readouterr().out
+    assert namespace["transport_ready"] is False
+    assert namespace["gpu_ready"] is False
+    assert all("doctor" not in call and "executor-probe" not in call for call in calls)
 
 
 @pytest.mark.parametrize("failure", ["executor-preflight", "executor-probe"])
