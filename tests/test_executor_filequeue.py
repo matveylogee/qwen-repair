@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 
 import pytest
@@ -276,6 +277,86 @@ def test_cancelled_active_execution_and_heartbeat_failure_do_not_kill_worker(tmp
     assert worker.process_once() == 1
     assert client.receive(request).status == "infra_error"
     assert worker.transport_issues["heartbeat"] == "heartbeat_publication_failed"
+
+
+@pytest.mark.parametrize("late_read", ["cancelled", "error"])
+def test_delayed_cancellation_read_cannot_cancel_next_request(tmp_path, monkeypatch, late_read):
+    from qwen_repair.executors import filequeue
+
+    client, worker, executor = queue_pair(tmp_path)
+    first = client.submit("first candidate", "sum_positive.public.v1")
+    blocked = threading.Event()
+    release = threading.Event()
+    cancelled = threading.Event()
+    main_thread = threading.current_thread()
+    stalled_threads = []
+    original_read = filequeue.read_message
+    original_run = executor.run
+
+    def delayed_read(directory):
+        if directory == tmp_path / "cancellations" / first.request_id and threading.current_thread() is not main_thread:
+            stalled_threads.append(threading.current_thread())
+            blocked.set()
+            assert release.wait(5)
+            if late_read == "error":
+                raise OSError("Delayed cloud read failed")
+            return {"request_id": first.request_id, "cancelled": True}
+        return original_read(directory)
+
+    def run_with_delayed_watcher(candidate, bundle_id):
+        if candidate == "first candidate":
+            assert blocked.wait(2)
+        else:
+            release.set()
+            stalled_threads[0].join(timeout=2)
+            assert not stalled_threads[0].is_alive()
+            assert not cancelled.is_set(), "The previous request cancelled the next execution"
+        return original_run(candidate, bundle_id)
+
+    monkeypatch.setattr(filequeue, "read_message", delayed_read)
+    monkeypatch.setattr(executor, "run", run_with_delayed_watcher)
+    monkeypatch.setattr(executor, "cancel_current", cancelled.set)
+    try:
+        assert worker.process_once() == 1
+        assert client.receive(first).status == "passed"
+        second = client.submit("next candidate", "sum_positive.public.v1")
+        assert worker.process_once() == 1
+        assert client.receive(second).status == "passed"
+        assert len(executor.calls) == 2
+    finally:
+        release.set()
+        for thread in stalled_threads:
+            thread.join(timeout=2)
+
+
+def test_cancellation_is_reasserted_after_executor_resets_flag(tmp_path, monkeypatch):
+    client, worker, executor = queue_pair(tmp_path)
+    request = client.submit("candidate", "sum_positive.public.v1")
+    first_cancel = threading.Event()
+    reset = threading.Event()
+    repeated_cancel = threading.Event()
+    cancelled = threading.Event()
+
+    def cancel_current():
+        after_reset = reset.is_set()
+        cancelled.set()
+        if after_reset:
+            repeated_cancel.set()
+        first_cancel.set()
+
+    def run_with_delayed_reset(candidate, bundle_id):
+        client.cancel(request.request_id)
+        assert first_cancel.wait(2)
+        cancelled.clear()
+        reset.set()
+        assert repeated_cancel.wait(2), "Cancellation was lost when the executor reset its flag"
+        assert cancelled.is_set()
+        return TestResult(status="infra_error", feedback="Cancelled", synthetic_demo=False)
+
+    monkeypatch.setattr(executor, "cancel_current", cancel_current)
+    monkeypatch.setattr(executor, "run", run_with_delayed_reset)
+    assert worker.process_once() == 1
+    assert client.receive(request).status == "infra_error"
 
 
 def test_preflight_skips_stale_and_legacy_heartbeats_without_reading(tmp_path, monkeypatch):

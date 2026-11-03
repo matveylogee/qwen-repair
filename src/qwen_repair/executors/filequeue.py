@@ -336,16 +336,20 @@ class QueueWorker:
         if self._cancelled(request):
             return _infra("Request expired or was cancelled.")
         done = threading.Event()
+        cancellation_lock = threading.Lock()
 
         def watch_cancel() -> None:
+            cancelled = False
             while not done.wait(0.1):
-                try:
-                    cancelled = self._cancelled(request)
-                except (OSError, ValueError):
-                    cancelled = True
+                if not cancelled:
+                    try:
+                        cancelled = self._cancelled(request)
+                    except (OSError, ValueError):
+                        cancelled = True
                 if cancelled:
-                    self.executor.cancel_current()
-                    return
+                    with cancellation_lock:
+                        if not done.is_set():
+                            self.executor.cancel_current()
 
         watcher = threading.Thread(target=watch_cancel, daemon=True)
         watcher.start()
@@ -357,7 +361,8 @@ class QueueWorker:
                 return _infra("Worker returned a synthetic outcome.")
             return result
         finally:
-            done.set()
+            with cancellation_lock:
+                done.set()
             watcher.join(timeout=1)
 
     def process_once(self) -> int:

@@ -34,24 +34,13 @@ def executor_factory(settings: ExecutorSettings, registry, *, run_id: str, polic
         return lambda task: backend
 
     def create(task):
-        if settings.backend == "http":
-            from qwen_repair.executors.http_client import HttpExecutor
-            backend = HttpExecutor(
-                settings.endpoint, registry, run_id=run_id, policy_version=policy_version,
-                task_id=task.task_id, limits=limits.model_dump(mode="json"),
-                token_env=settings.token_env, deadline_seconds=settings.deadline_seconds,
-                poll_interval=settings.poll_interval,
-            )
-        else:
-            backend = FileQueueExecutor(
-                settings.queue_dir, registry, run_id=run_id, policy_version=policy_version,
-                task_id=task.task_id, limits=limits.model_dump(mode="json"),
-                deadline_seconds=settings.deadline_seconds, poll_interval=settings.poll_interval,
-            )
+        backend = FileQueueExecutor(
+            settings.queue_dir, registry, run_id=run_id, policy_version=policy_version,
+            task_id=task.task_id, limits=limits.model_dump(mode="json"),
+            deadline_seconds=settings.deadline_seconds, poll_interval=settings.poll_interval,
+        )
         report = backend.preflight()
         if not report["passed"]:
-            if settings.backend == "http":
-                raise RuntimeError("HTTP executor preflight failed; check worker readiness, endpoint, credentials and execution profile")
             raise RuntimeError("No compatible queue worker. Start the Docker worker and verify folder synchronization first.")
         backend.preflight_report = report
         return backend

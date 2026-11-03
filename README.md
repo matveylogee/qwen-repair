@@ -1,6 +1,6 @@
 # Qwen Code Repair
 
-Проект содержит синтетический CPU-прототип M0 и реализацию коротких проверок M1: Qwen inference, Docker executor, HTTP transport, файловую очередь, LoRA SFT и multi-turn TRL GRPO. Локальные проверки Docker и trainer выполнены; запуск Qwen на T4 и удалённую связь Colab с Mac нужно подтвердить отдельно. Обмен через Google Drive поддерживается файловой очередью; HTTP доступен как альтернативный транспорт. Инструкции: [M1](docs/m1.md), [результаты проверок](docs/m1_validation.md).
+Проект содержит синтетический CPU-прототип M0 и реализацию коротких проверок M1: Qwen inference, Docker executor, файловую очередь, LoRA SFT и multi-turn TRL GRPO. Локальные проверки Docker и trainer выполнены; запуск Qwen на T4 и удалённую связь Colab с Mac нужно подтвердить отдельно. Обмен между Colab и Docker worker на Mac выполняется через Google Drive. Инструкции: [M1](docs/m1.md), [результаты проверок](docs/m1_validation.md).
 
 M0 проверяет протокол исправления Python-кода на CPU: подготовленный ответ, публичная обратная связь, следующая попытка, отдельная скрытая оценка и сохранение артефактов. `ScriptedPolicy` возвращает заданные строки, а `FakeExecutor` ищет заранее записанный результат. Код кандидатов и тестовые случаи не исполняются.
 
@@ -58,4 +58,6 @@ python -m pytest -q
 
 Откройте `notebooks/00_preflight.ipynb`, укажите свой URL репозитория и полный commit SHA. Notebook устанавливает эту версию пакета и вызывает `doctor`, fake demo и `summarize`. Выводы ячеек в репозитории не сохранены. Для этого notebook достаточно CPU runtime.
 
-Для обмена через Drive используется `My Drive/qwen-repair-exchange`: My Drive в режиме Stream, синхронизация папок компьютера отключена. Это не ограничивает весь клиент Drive одной папкой. Порядок запуска файловой очереди и устранения неполадок описан в [docs/m1.md](docs/m1.md). `notebooks/01_m1_feasibility.ipynb` пока сохраняет HTTP-настройку и Drive не подключает; перед запуском через Drive его нужно адаптировать. HTTP остаётся доступным по [отдельной инструкции](docs/m1_http.md). Наличие GPU не заменяет проверку изоляции executor.
+Для первой проверки M1 откройте `notebooks/01_m1_feasibility.ipynb` в CPU runtime, укажите полный `COMMIT_SHA` и одинаковый `SESSION_NAME` на Mac и в Colab. Notebook подключает Drive и проверяет очередь `My Drive/qwen-repair-exchange/sessions/<SESSION_NAME>` до загрузки модели. По умолчанию `RUN_INFERENCE=False` и `RUN_TRAINING=False`: GPU-пакеты и веса не загружаются. Порядок запуска Mac worker приведён в [docs/m1.md](docs/m1.md).
+
+На Mac используется Stream для My Drive, синхронизация папок компьютера отключена. Это не ограничивает весь клиент Drive одной папкой. После успешного обмена можно отдельно включить модельные этапы на T4. Наличие GPU не заменяет проверку изоляции executor.

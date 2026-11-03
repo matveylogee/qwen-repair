@@ -9,11 +9,9 @@ from qwen_repair.policies.transformers import QWEN_MODEL_ID, QWEN_REVISION
 
 class ExecutorSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-    backend: Literal["docker", "file_queue", "http"]
+    backend: Literal["docker", "file_queue"]
     image: str | None = None
     queue_dir: str | None = None
-    endpoint: str | None = None
-    token_env: str = Field(default="QREPAIR_EXECUTOR_TOKEN", pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
     deadline_seconds: float = Field(default=120, gt=0, le=3600)
     poll_interval: float = Field(default=0.5, ge=0.05, le=10)
     timeout_seconds: float = Field(default=5, gt=0, le=60)
@@ -24,20 +22,11 @@ class ExecutorSettings(BaseModel):
             raise ValueError("Executor profile requires the worker image pinned by digest")
         if self.backend == "file_queue" and not self.queue_dir:
             raise ValueError("File queue executor requires queue_dir")
-        if self.backend == "http":
-            from qwen_repair.executors.http_client import validate_endpoint
-            if not self.endpoint:
-                raise ValueError("HTTP executor requires endpoint")
-            self.endpoint = validate_endpoint(self.endpoint)
-        elif self.endpoint is not None:
-            raise ValueError("endpoint is only valid for the HTTP executor")
         return self
 
     def artifact_config(self) -> dict:
         fields = {"backend", "image", "timeout_seconds", "deadline_seconds", "poll_interval"}
-        if self.backend == "http":
-            fields.add("endpoint")
-        elif self.backend == "file_queue":
+        if self.backend == "file_queue":
             fields.add("queue_dir")
         return self.model_dump(mode="json", include=fields)
 
