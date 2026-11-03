@@ -30,16 +30,28 @@ def executor_factory(settings: ExecutorSettings, registry, *, run_id: str, polic
         report = backend.preflight()
         if not report["passed"]:
             raise RuntimeError(f"Docker preflight failed: {json.dumps(report, ensure_ascii=False)}")
+        backend.preflight_report = report
         return lambda task: backend
 
     def create(task):
-        backend = FileQueueExecutor(
-            settings.queue_dir, registry, run_id=run_id, policy_version=policy_version,
-            task_id=task.task_id, limits=limits.model_dump(mode="json"),
-            deadline_seconds=settings.deadline_seconds, poll_interval=settings.poll_interval,
-        )
+        if settings.backend == "http":
+            from qwen_repair.executors.http_client import HttpExecutor
+            backend = HttpExecutor(
+                settings.endpoint, registry, run_id=run_id, policy_version=policy_version,
+                task_id=task.task_id, limits=limits.model_dump(mode="json"),
+                token_env=settings.token_env, deadline_seconds=settings.deadline_seconds,
+                poll_interval=settings.poll_interval,
+            )
+        else:
+            backend = FileQueueExecutor(
+                settings.queue_dir, registry, run_id=run_id, policy_version=policy_version,
+                task_id=task.task_id, limits=limits.model_dump(mode="json"),
+                deadline_seconds=settings.deadline_seconds, poll_interval=settings.poll_interval,
+            )
         report = backend.preflight()
         if not report["passed"]:
+            if settings.backend == "http":
+                raise RuntimeError("HTTP executor preflight failed; check worker readiness, endpoint, credentials and execution profile")
             raise RuntimeError("No compatible queue worker. Start the Docker worker and verify folder synchronization first.")
         backend.preflight_report = report
         return backend
@@ -64,18 +76,18 @@ def run_inference(config: InferenceConfig, settings: ExecutorSettings, output: P
         raise ValueError("No tasks selected")
     run_id = uuid4().hex
     factory = executor_factory(settings, registry, run_id=run_id, policy_version="preload")
-    factory(tasks[0])
+    first_backend = factory(tasks[0])
     output.mkdir(parents=True, exist_ok=False)
     manifest = RunManifest(
         run_id=run_id, status="running", synthetic_demo=False,
         created_at=datetime.now(timezone.utc).isoformat(), package_version=__version__,
         **git_state(Path.cwd()), config=config.model_dump(mode="json"), seed=config.seed,
         policy_version=f"{config.model_id}@{config.model_revision}", prompt_version=PROMPT_VERSION,
-        runner_version="docker-json-v1" if settings.backend == "docker" else "filequeue-v1",
+        runner_version=first_backend.runner_version,
         token_count_method="tokenizer", model_revision=config.model_revision,
         tokenizer_revision=config.tokenizer_revision, fixture_hashes={},
         source_hashes={path.relative_to(Path(__file__).parent).as_posix(): sha256(path) for path in sorted(Path(__file__).parent.rglob("*.py"))},
-        dataset_hashes=dataset_hashes, executor_config=settings.model_dump(mode="json"),
+        dataset_hashes=dataset_hashes, executor_config=settings.artifact_config(),
     )
     write_json(output / "manifest.json", manifest)
     try:
@@ -105,7 +117,7 @@ def run_inference(config: InferenceConfig, settings: ExecutorSettings, output: P
         metrics = summarize(trajectories, evaluations)
         environment = inspect_environment(DemoConfig())
         environment.update({"synthetic_demo": False, "config": config.model_dump(mode="json"), "token_count_method": "tokenizer",
-                            "executors": {"fake": False, "real_isolated": True}, "executor_profile": settings.model_dump(mode="json"),
+                            "executors": {"fake": False, "real_isolated": True}, "executor_profile": settings.artifact_config(),
                             "executor_preflight": executor_reports})
         if settings.backend == "docker":
             environment["docker"] = {

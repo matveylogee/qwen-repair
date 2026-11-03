@@ -284,17 +284,38 @@ def finish_run(config, output, trainer, started, dtype_name, **extra):
     return summary
 
 
+def executor_provenance(backend) -> dict:
+    from qwen_repair.executors.docker import DockerConfig
+
+    profile = getattr(backend, "config", None)
+    profile = profile.model_dump() if hasattr(profile, "model_dump") else getattr(backend, "limits", {})
+    profile = DockerConfig.model_validate({key: profile[key] for key in DockerConfig.model_fields if key in profile}).model_dump(mode="json")
+    report = backend._repair_training_preflight
+    safe_report = {key: report[key] for key in (
+        "schema_version", "backend", "synthetic_demo", "passed", "authenticated", "workers",
+        "checked_at", "legacy_heartbeats_ignored", "reason", "checks", "limitations",
+        "limits_hash", "bundle_hashes",
+    ) if key in report}
+    if "config" in report:
+        safe_report["config"] = profile
+    if "image" in report:
+        safe_report["image"] = profile["image"]
+    result = {
+        "runner_version": backend.runner_version, "profile": profile, "preflight": safe_report,
+        "test_bundle_hashes": backend.registry.hashes(), "transport_run_id": getattr(backend, "run_id", None),
+    }
+    if backend.runner_version == "http-json-v1":
+        from qwen_repair.executors.http_client import validate_endpoint
+        result["endpoint"] = validate_endpoint(backend.endpoint)
+    return result
+
+
 def record_executors(output: Path, fixtures, executors):
     manifest = json.loads((output / "manifest.json").read_text())
     manifest["executors"] = []
     for fixture, backend in zip(fixtures, executors, strict=True):
-        profile = getattr(backend, "config", None)
-        profile = profile.model_dump() if hasattr(profile, "model_dump") else getattr(backend, "limits", {})
         manifest["executors"].append({
-            "task_id": fixture.task.task_id, "runner_version": backend.runner_version,
-            "profile": profile, "preflight": backend._repair_training_preflight,
-            "test_bundle_hashes": backend.registry.hashes(),
-            "transport_run_id": getattr(backend, "run_id", None),
+            "task_id": fixture.task.task_id, **executor_provenance(backend),
         })
     previous = manifest.get("resumed_executor_profiles")
     if previous:

@@ -48,7 +48,9 @@ Manifest сохраняет параметры, seed и сведения о ко
 
 `TransformersPolicy` использует закреплённые модель и tokenizer, non-thinking chat template и настоящий счётчик токенов. `TokenConversation` хранит исходные prompt/completion token IDs: при следующей попытке feedback добавляется к существующему префиксу. M0 сохраняет отдельный счётчик байтов.
 
-`DockerExecutor` запускает JSON-функцию в ограниченном контейнере, а сравнение с ожидаемым ответом выполняет доверенный supervisor. `FileQueueExecutor` передаёт запросы локальному Docker worker через папку с payload/checksum/READY и проверкой IDs, хешей, сроков и отмены. Успешный preflight обязателен; отсутствие Docker или worker не включает выполнение кандидатов на хосте.
+`DockerExecutor` запускает JSON-функцию в ограниченном контейнере, а сравнение с ожидаемым ответом выполняет доверенный supervisor. HTTP transport передаёт запросы с bearer token серверу на Mac через временный HTTPS-туннель. Сервер слушает loopback, использует доверенный registry и фиксированные лимиты Docker. Токен хранится отдельно от конфигурации и артефактов запуска.
+
+`FileQueueExecutor` остаётся альтернативой: он передаёт запросы локальному Docker worker через папку с payload/checksum/READY и проверкой IDs, хешей, сроков и отмены. HTTP добавлен после проблем с нагрузкой и задержками Drive Desktop; это изменение первоначального плана без публичного туннеля. Причина нагрузки Desktop не доказана, файловая очередь не исключена из проекта. Успешный preflight обязателен для обоих транспортов; отсутствие Docker или worker не включает выполнение кандидатов на хосте.
 
 Inference сохраняет обычный run bundle с `synthetic_demo=false`. SFT и GRPO сохраняют training manifest, masks/rollouts, отдельную private evaluation и checkpoints с completion marker. SFT использует стандартный Transformers Trainer; GRPO использует стандартный TRL trainer с проверенным `env_mask`. Обучение ограничено smoke-профилем; большие эксперименты пока не запускаются.
 

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 
@@ -13,9 +14,15 @@ def add_arguments(commands):
     worker.add_argument("--queue", required=True, type=Path)
     worker.add_argument("--registry", type=Path)
     worker.add_argument("--once", action="store_true")
-    probe = commands.add_parser("queue-probe", help="Measure one real request round trip before rollout")
+    http_worker = commands.add_parser("http-worker", help="Serve trusted Docker tests over authenticated loopback HTTP")
+    http_worker.add_argument("--config", required=True, type=Path)
+    http_worker.add_argument("--port", type=int, default=8765)
+    http_worker.add_argument("--token-file", required=True, type=Path)
+    http_worker.add_argument("--registry", type=Path)
+    probe = commands.add_parser("executor-probe", aliases=["queue-probe"], help="Measure one real request round trip before rollout")
     probe.add_argument("--config", required=True, type=Path)
     probe.add_argument("--output", required=True, type=Path)
+    probe.add_argument("--registry", type=Path)
     fetch = commands.add_parser("pilot-fetch", help="Download at most 100 rows at a pinned KodCode revision")
     fetch.add_argument("--output", required=True, type=Path)
     fetch.add_argument("--limit", type=int, default=100)
@@ -79,7 +86,7 @@ def run_command(args):
         settings = read_yaml_model(args.executor_config, ExecutorSettings)
         factory = executor_factory(settings, registry, run_id=uuid4().hex, policy_version="reference-validation")
         return validate_pilot(args.source, args.output, factory)
-    if args.command in {"executor-preflight", "queue-worker", "queue-probe"}:
+    if args.command in {"executor-preflight", "queue-worker", "http-worker", "executor-probe", "queue-probe"}:
         settings = read_yaml_model(args.config, ExecutorSettings)
         registry_path = getattr(args, "registry", None)
         registry = load_registry(registry_path) if registry_path else registry_from_fixtures()
@@ -87,6 +94,12 @@ def run_command(args):
         if args.command == "executor-preflight":
             if settings.backend == "docker":
                 executor = DockerExecutor(registry, limits)
+            elif settings.backend == "http":
+                from qwen_repair.executors.http_client import HttpExecutor
+                executor = HttpExecutor(settings.endpoint, registry, run_id=uuid4().hex,
+                                        policy_version="preflight", task_id="preflight", limits=limits.model_dump(mode="json"),
+                                        token_env=settings.token_env, deadline_seconds=settings.deadline_seconds,
+                                        poll_interval=settings.poll_interval)
             else:
                 executor = FileQueueExecutor(settings.queue_dir, registry, run_id=uuid4().hex,
                                              policy_version="preflight", task_id="preflight", limits=limits.model_dump(mode="json"),
@@ -94,13 +107,29 @@ def run_command(args):
             report = executor.preflight()
             _save_report(args.output, report)
             return report
-        if args.command == "queue-worker":
+        if args.command in {"queue-worker", "http-worker"}:
             if settings.backend != "docker":
                 raise ValueError("The local worker requires a Docker executor profile")
+            if args.command == "http-worker" and not 1 <= args.port <= 65535:
+                raise ValueError("HTTP worker port must be between 1 and 65535")
             executor = DockerExecutor(registry, limits)
             report = executor.preflight()
             if not report["passed"]:
                 return report
+            if args.command == "http-worker":
+                from qwen_repair.executors.http_auth import load_or_create_token
+                from qwen_repair.executors.http_server import make_server
+                token = load_or_create_token(args.token_file)
+                server = make_server(executor, registry, token, port=args.port)
+                try:
+                    print(json.dumps({"status": "ready", "endpoint": f"http://127.0.0.1:{server.server_address[1]}",
+                                      "token_file": str(args.token_file)}, sort_keys=True), flush=True)
+                    server.serve_forever()
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    server.server_close()
+                return {"status": "stopped", "runner_version": "http-json-v1"}
             worker = QueueWorker(args.queue, registry, executor)
             completed = 0
             try:
@@ -115,11 +144,12 @@ def run_command(args):
                 worker.close()
             return {"status": "stopped", "completed_requests": completed}
         fixture = load_fixture("sum_positive")
-        factory = executor_factory(settings, registry, run_id=uuid4().hex, policy_version="queue-probe")
+        factory = executor_factory(settings, registry, run_id=uuid4().hex, policy_version="executor-probe")
         executor = factory(fixture.task)
         started = perf_counter()
         result = executor.run(fixture.corrected_code, fixture.task.public_tests_ref)
         report = {"schema_version": "1.0", "kind": "executor_roundtrip_probe", "synthetic_demo": False,
+                  "runner_version": executor.runner_version, "executor_profile": settings.artifact_config(),
                   "passed": result.status == "passed" and not result.synthetic_demo,
                   "roundtrip_seconds": perf_counter() - started, "executor_seconds": result.duration_seconds,
                   "result": result.model_dump(mode="json")}
