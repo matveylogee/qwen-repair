@@ -114,6 +114,26 @@ def test_multiple_workers_and_expired_heartbeats_fail_closed(tmp_path, monkeypat
     assert client.run("candidate", "sum_positive.public.v1").status == "infra_error"
 
 
+def test_idle_worker_limits_heartbeat_files_without_extending_freshness(tmp_path, monkeypatch):
+    started = 1_800_000_000.0
+    clock = [started]
+    monkeypatch.setattr("qwen_repair.executors.filequeue.time.time", lambda: clock[0])
+    client, worker, executor = queue_pair(tmp_path)
+    for second in range(1, 91):
+        clock[0] = started + second
+        assert worker.process_once() == 0
+        assert client.preflight()["passed"]
+    heartbeats = sorted((tmp_path / "heartbeats").iterdir())
+    assert len(heartbeats) == 4
+    assert sum(len(list(directory.iterdir())) for directory in heartbeats) == 12
+    assert [read_message(directory)["created_at"] - started for directory in heartbeats] == [0, 30, 60, 90]
+    assert executor.calls == []
+    clock[0] = started + 209.999
+    assert client.preflight()["passed"]
+    clock[0] = started + 210
+    assert not client.preflight()["passed"]
+
+
 def test_corrupt_response_checksum_rejected(tmp_path):
     client, worker, _ = queue_pair(tmp_path)
     request = client.submit("def sum_positive(values): return 1", "sum_positive.public.v1")

@@ -267,7 +267,7 @@ class QueueWorker:
 
     def heartbeat(self) -> None:
         now = time.time()
-        if self._closed or now - self._last_heartbeat < 10:
+        if self._closed or now - self._last_heartbeat < 30:
             return
         directory = self.root / "heartbeats" / f"{int(now * 1000)}-{self.worker_id}"
         publish_message(directory, {

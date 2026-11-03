@@ -137,7 +137,7 @@ def run_command(args):
                     completed += worker.process_once()
                     if args.once:
                         break
-                    sleep(0.25)
+                    sleep(1.0)
             except KeyboardInterrupt:
                 pass
             finally:
