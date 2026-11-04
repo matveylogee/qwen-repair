@@ -47,7 +47,7 @@ def tiny_model():
     return add_lora(model, rank=2), tokenizer, fixture
 
 
-def child_sft(output, resume=False):
+def child_sft(output, resume=False, uninterrupted=False):
     from qwen_repair.training.common import verify_checkpoint
     from qwen_repair.training.config import SFTConfig
     from qwen_repair.training.sft import make_sft_trainer, supervised_record, verify_adapter_roundtrip
@@ -56,7 +56,7 @@ def child_sft(output, resume=False):
     output.mkdir(exist_ok=True)
     model, tokenizer, fixture = tiny_model()
     config = SFTConfig(device="cpu", gradient_checkpointing=False, lora_rank=2,
-                       max_steps=2, stop_after_steps=None if resume else 1)
+                       max_steps=2, stop_after_steps=None if resume or uninterrupted else 1)
     records = [supervised_record(tokenizer, tokenizer.encode("Repair the function:\n"),
                                  f"```python\n{fixture.corrected_code}\n```", 512)] * 2
     trainer = make_sft_trainer(model, tokenizer, records, config, output, allow_test_checkpoint=True)
@@ -64,14 +64,48 @@ def child_sft(output, resume=False):
     if checkpoint:
         verify_checkpoint(checkpoint, config, allow_test_checkpoint=True)
     trainer.train(resume_from_checkpoint=str(checkpoint) if checkpoint else None)
+    updates = trainer.repair_training_evidence.summary()
+    assert updates["attempted"] == updates["applied"] == updates["nonzero_gradient_steps"] == (2 if uninterrupted else 1)
+    assert updates["skipped"] == 0
+    assert updates["trainable_parameters_changed"] is True
+    assert updates["before_sha256"] != updates["after_sha256"]
+    if resume:
+        previous = json.loads((checkpoint / "checkpoint_complete.json").read_text())
+        assert updates["before_sha256"] == previous["optimizer_updates"]["after_sha256"]
     trainer.save_model(str(output / "adapter"))
     evidence = verify_adapter_roundtrip(model, output / "adapter", records[0]["input_ids"][:10])
     (output / "child_result.json").write_text(json.dumps({"step": trainer.state.global_step, **evidence}))
 
 
+def assert_checkpoint_states_equal(first, second):
+    import numpy as np
+    from safetensors.torch import load_file
+
+    def compare(left, right):
+        assert type(left) is type(right)
+        if isinstance(left, torch.Tensor):
+            assert torch.equal(left, right)
+        elif isinstance(left, np.ndarray):
+            np.testing.assert_array_equal(left, right)
+        elif isinstance(left, dict):
+            assert left.keys() == right.keys()
+            for key in left:
+                compare(left[key], right[key])
+        elif isinstance(left, (list, tuple)):
+            assert len(left) == len(right)
+            for a, b in zip(left, right, strict=True):
+                compare(a, b)
+        else:
+            assert left == right
+
+    compare(load_file(first / "adapter_model.safetensors"), load_file(second / "adapter_model.safetensors"))
+    for name in ("optimizer.pt", "scheduler.pt", "rng_state.pth"):
+        compare(torch.load(first / name, weights_only=False), torch.load(second / name, weights_only=False))
+
+
 def test_tiny_cpu_sft_checkpoint_resume_in_new_process_and_adapter_roundtrip(tmp_path):
     test_file = str(Path(__file__).resolve())
-    code = "import runpy,sys; mod=runpy.run_path(sys.argv[1]); mod['child_sft'](sys.argv[2], sys.argv[3]=='resume')"
+    code = "import runpy,sys; mod=runpy.run_path(sys.argv[1]); mod['child_sft'](sys.argv[2], sys.argv[3]=='resume', sys.argv[3]=='uninterrupted')"
     run_dir = tmp_path / "sft"
     for stage, expected_step in (("initial", 1), ("resume", 2)):
         result = subprocess.run([sys.executable, "-c", code, test_file, str(run_dir), stage],
@@ -83,6 +117,11 @@ def test_tiny_cpu_sft_checkpoint_resume_in_new_process_and_adapter_roundtrip(tmp
         assert evidence["adapter_roundtrip_max_abs_diff"] == 0.0
     assert (run_dir / "checkpoint-1/checkpoint_complete.json").exists()
     assert (run_dir / "checkpoint-2/checkpoint_complete.json").exists()
+    uninterrupted = tmp_path / "sft-uninterrupted"
+    result = subprocess.run([sys.executable, "-c", code, test_file, str(uninterrupted), "uninterrupted"],
+                            capture_output=True, text=True, timeout=90)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert_checkpoint_states_equal(run_dir / "checkpoint-2", uninterrupted / "checkpoint-2")
 
 
 def test_tiny_cpu_standard_trl_runs_two_updates_with_action_masks(tmp_path):
@@ -141,6 +180,10 @@ def test_tiny_cpu_standard_trl_runs_two_updates_with_action_masks(tmp_path):
     assert rollout.groups == rollout.nonzero_variance_groups == 2
     assert len(samples) == 8
     assert any(not torch.equal(original[name], value) for name, value in model.named_parameters() if name in original)
+    updates = trainer.repair_training_evidence.summary()
+    assert updates["attempted"] == updates["applied"] == updates["nonzero_gradient_steps"] == 2
+    assert updates["skipped"] == updates["nonfinite_gradient_steps"] == 0
+    assert updates["trainable_parameters_changed"] is True
     public = [json.loads(line) for line in (tmp_path / "rollouts.jsonl").read_text().splitlines()]
     private = [json.loads(line) for line in (tmp_path / "private_evaluation.jsonl").read_text().splitlines()]
     public_ids = {(row["run_id"], row["episode_id"]) for row in public}
@@ -163,7 +206,7 @@ def test_tiny_cpu_standard_trl_runs_two_updates_with_action_masks(tmp_path):
             assert torch.count_nonzero(logps.grad[row][second_action]).item() > 0
 
 
-def child_grpo(output, resume=False):
+def child_grpo(output, resume=False, uninterrupted=False):
     from qwen_repair.schemas import TestResult
     from qwen_repair.training.common import verify_checkpoint
     from qwen_repair.training.config import GRPOConfig
@@ -178,7 +221,7 @@ def child_grpo(output, resume=False):
             return TestResult(status="failed", tests_total=1, tests_failed=1, synthetic_demo=False)
 
     config = GRPOConfig(sft_adapter="unused-in-test", device="cpu", gradient_checkpointing=False,
-                        lora_rank=2, max_steps=2, stop_after_steps=None if resume else 1,
+                        lora_rank=2, max_steps=2, stop_after_steps=None if resume or uninterrupted else 1,
                         max_new_tokens=4, max_context_tokens=1024)
     trainer, rollout = make_grpo_trainer(model, tokenizer, [fixture], [SimulatedJudge()], config, output,
                                        allow_test_checkpoint=True)
@@ -186,12 +229,17 @@ def child_grpo(output, resume=False):
     if checkpoint:
         verify_checkpoint(checkpoint, config, allow_test_checkpoint=True)
     trainer.train(resume_from_checkpoint=str(checkpoint) if checkpoint else None)
+    updates = trainer.repair_training_evidence.summary()
+    assert updates["applied"] == (2 if uninterrupted else 1)
+    assert updates["nonzero_gradient_steps"] == updates["parameter_change_steps"] == 0
+    assert updates["trainable_parameters_changed"] is False
+    assert updates["before_sha256"] == updates["after_sha256"]
     (output / "child_result.json").write_text(json.dumps({"step": trainer.state.global_step, "groups": rollout.groups}))
 
 
 def test_tiny_cpu_grpo_sampled_rollouts_resume_in_new_process(tmp_path):
     test_file = str(Path(__file__).resolve())
-    code = "import runpy,sys; mod=runpy.run_path(sys.argv[1]); mod['child_grpo'](sys.argv[2], sys.argv[3]=='resume')"
+    code = "import runpy,sys; mod=runpy.run_path(sys.argv[1]); mod['child_grpo'](sys.argv[2], sys.argv[3]=='resume', sys.argv[3]=='uninterrupted')"
     run_dir = tmp_path / "grpo-resume"
     for stage, expected_step in (("initial", 1), ("resume", 2)):
         result = subprocess.run([sys.executable, "-c", code, test_file, str(run_dir), stage],
@@ -203,6 +251,58 @@ def test_tiny_cpu_grpo_sampled_rollouts_resume_in_new_process(tmp_path):
     groups = [json.loads(line) for line in (run_dir / "groups.jsonl").read_text().splitlines()]
     assert [row["policy_version"] for row in groups] == ["step-0", "step-1"]
     assert len({row["group"] for row in groups}) == 2
+    uninterrupted = tmp_path / "grpo-uninterrupted"
+    result = subprocess.run([sys.executable, "-c", code, test_file, str(uninterrupted), "uninterrupted"],
+                            capture_output=True, text=True, timeout=90)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert_checkpoint_states_equal(run_dir / "checkpoint-2", uninterrupted / "checkpoint-2")
+    resumed_actions = [json.loads(line)["completion_ids"] for line in (run_dir / "rollouts.jsonl").read_text().splitlines()]
+    uninterrupted_actions = [json.loads(line)["completion_ids"] for line in (uninterrupted / "rollouts.jsonl").read_text().splitlines()]
+    assert resumed_actions == uninterrupted_actions
+
+
+def test_evidence_distinguishes_a_simulated_skipped_step_from_an_update():
+    from qwen_repair.training.common import checkpoint_callback
+    from qwen_repair.training.config import SFTConfig
+
+    model = torch.nn.Linear(1, 1, bias=False)
+    callback = checkpoint_callback(SFTConfig(device="cpu"), allow_test_checkpoint=True)
+    state, args, control = SimpleNamespace(global_step=0), SimpleNamespace(), SimpleNamespace()
+    callback.on_train_begin(args, state, control, model=model)
+    model.weight.grad = torch.full_like(model.weight, float("inf"))
+    callback.on_pre_optimizer_step(args, state, control, model=model)
+    callback.on_optimizer_step(args, state, control, model=model, optimizer=SimpleNamespace(step_was_skipped=True))
+    skipped = callback.summary()
+    assert skipped["attempted"] == skipped["skipped"] == skipped["nonfinite_gradient_steps"] == 1
+    assert skipped["applied"] == skipped["nonzero_gradient_steps"] == skipped["parameter_change_steps"] == 0
+    assert skipped["before_sha256"] == skipped["after_sha256"]
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    state.global_step = 1
+    model.weight.grad = torch.ones_like(model.weight)
+    callback.on_pre_optimizer_step(args, state, control, model=model)
+    optimizer.step()
+    callback.on_optimizer_step(args, state, control, model=model, optimizer=optimizer)
+    updated = callback.summary()
+    assert updated["attempted"] == 2
+    assert updated["applied"] == updated["nonzero_gradient_steps"] == updated["parameter_change_steps"] == 1
+    assert updated["trainable_parameters_changed"] is True
+
+
+def test_sampled_action_logprobs_match_teacher_forcing_on_both_turns(tmp_path):
+    from qwen_repair.training.config import GRPOConfig
+    from qwen_repair.training.grpo import MultiTurnRollout
+
+    model, tokenizer, fixture = tiny_model()
+    model.eval()
+    rollout = MultiTurnRollout(tokenizer, [fixture], [None],
+                               GRPOConfig(sft_adapter="unused", device="cpu", max_new_tokens=4, max_context_tokens=1024), tmp_path)
+    episode = rollout._episode(model, rollout.rows[0]["prompt"], fixture, None, "test")
+    for attempt in episode["attempts"]:
+        inputs = torch.tensor([attempt["prompt_ids"] + attempt["action_ids"]])
+        with torch.no_grad():
+            logits = model(inputs).logits[0, len(attempt["prompt_ids"]) - 1:-1].float()
+            logps = logits.log_softmax(-1).gather(-1, torch.tensor(attempt["action_ids"]).unsqueeze(-1)).squeeze(-1)
+        torch.testing.assert_close(torch.tensor(attempt["action_logprobs"]), logps, rtol=1e-5, atol=1e-5)
 
 
 def test_resumed_training_summary_labels_process_segment_metrics(tmp_path):
@@ -214,10 +314,13 @@ def test_resumed_training_summary_labels_process_segment_metrics(tmp_path):
         state=SimpleNamespace(global_step=2, log_history=[{"step": 1, "loss": 3.0}, {"step": 2, "loss": 2.0}]),
         save_model=lambda path: Path(path).mkdir(),
         processing_class=SimpleNamespace(save_pretrained=lambda path: None),
+        repair_training_evidence=SimpleNamespace(summary=lambda: {"applied": 0, "attempted": 1, "skipped": 1}),
     )
     result = finish_run(SFTConfig(device="cpu"), tmp_path, trainer, perf_counter(), "float32", reward_groups=1)
     assert result["metrics_scope"] == "current_process_segment"
     assert result["global_step_scope"] == "cumulative"
     assert result["global_step"] == 2
-    assert result["optimizer_steps_in_segment"] == result["reward_groups"] == 1
+    assert result["trainer_steps_in_segment"] == result["reward_groups"] == 1
+    assert result["optimizer_steps_in_segment"] == 0
+    assert result["optimizer_updates"]["skipped"] == 1
     assert result["training_log"] == [{"step": 2, "loss": 2.0}]

@@ -95,6 +95,27 @@ def test_expiry_and_cancellation_do_not_execute_candidate(tmp_path):
     assert not executor.calls
 
 
+@pytest.mark.parametrize("interrupt_during_publication", [False, True])
+def test_keyboard_interrupt_cancels_the_published_request(tmp_path, monkeypatch, interrupt_during_publication):
+    client, worker, executor = queue_pair(tmp_path)
+    original_publish = client.redeliver
+
+    def interrupt(request):
+        if interrupt_during_publication:
+            original_publish(request)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(client, "redeliver" if interrupt_during_publication else "receive", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        client.run("def sum_positive(values): return 1", "sum_positive.public.v1")
+    requests = list((tmp_path / "requests").iterdir())
+    assert len(requests) == 1
+    assert read_message(tmp_path / "cancellations" / requests[0].name)["cancelled"] is True
+    assert not client.pending
+    assert worker.process_once() == 1
+    assert executor.calls == []
+
+
 def test_changed_resource_limits_rejected_by_worker(tmp_path):
     client, worker, executor = queue_pair(tmp_path)
     client.limits["memory_mb"] = 4096

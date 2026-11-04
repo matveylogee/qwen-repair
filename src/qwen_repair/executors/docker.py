@@ -161,11 +161,9 @@ class DockerExecutor:
                 except subprocess.TimeoutExpired:
                     status = "timeout"
                 else:
-                    if returncode in (125, 126, 127):
-                        status = "infra_error"
-                    elif returncode == 137:
-                        status = "resource_limit"
-                    elif returncode:
+                    if returncode:
+                        # docker start forwards candidate exit codes.
+                        # Container inspection distinguishes these from CLI failures.
                         status = "runtime_error"
         finally:
             selector.close()

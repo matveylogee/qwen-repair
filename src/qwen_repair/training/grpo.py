@@ -65,8 +65,8 @@ class MultiTurnRollout:
         started = perf_counter()
         with torch.no_grad():
             result = model.generate(inputs, attention_mask=torch.ones_like(inputs), generation_config=settings)
-        self.generation_seconds += perf_counter() - started
         ids = result.sequences[0].tolist()
+        self.generation_seconds += perf_counter() - started
         if ids[:len(prompt_ids)] != prompt_ids:
             raise RuntimeError("Generation changed the original token prefix")
         action_ids = ids[len(prompt_ids):]
@@ -223,6 +223,7 @@ def make_grpo_trainer(model, tokenizer, fixtures, executors, config, output: Pat
         callbacks=[callback],
     )
     callback.scaler_getter = lambda: getattr(trainer.accelerator, "scaler", None) is not None
+    trainer.repair_training_evidence = callback
     return trainer, rollout
 
 
@@ -265,6 +266,11 @@ def run_grpo_smoke(config, output, executor, resume_from=None):
             tokens_per_second=rollout.generated_tokens / rollout.generation_seconds if rollout.generation_seconds else None,
             executor_seconds=rollout.executor_seconds,
             kl_coefficient=0.0,
+        )
+        updates = result["optimizer_updates"]
+        result["learning_signal_observed"] = bool(
+            rollout.nonzero_variance_groups and updates["nonzero_gradient_steps"]
+            and updates["trainable_parameters_changed"]
         )
         probe = TokenConversation.start(tokenizer, [Message.model_validate(item) for item in rollout.rows[0]["prompt"]])
         result.update(verify_adapter_roundtrip(model, output / "adapter", probe.token_ids[:32]))

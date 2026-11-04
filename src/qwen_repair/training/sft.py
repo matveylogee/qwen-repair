@@ -112,6 +112,7 @@ def make_sft_trainer(model, tokenizer, records, config, output: Path, dtype_name
         callbacks=[callback],
     )
     callback.scaler_getter = lambda: getattr(trainer.accelerator, "scaler", None) is not None
+    trainer.repair_training_evidence = callback
     return trainer
 
 

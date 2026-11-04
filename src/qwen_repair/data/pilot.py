@@ -2,6 +2,7 @@ import ast
 import copy
 import difflib
 import hashlib
+import inspect
 import json
 import math
 from collections import Counter
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from qwen_repair.artifacts import write_json
-from qwen_repair.schemas import TaskRecord
+from qwen_repair.schemas import TaskRecord, TestResult
 
 
 DATASET_ID = "KodCode/KodCode-Light-RL-10K"
@@ -48,7 +49,36 @@ def _json_value(node: ast.AST, names: dict[str, Any]) -> Any:
     return normalize(value)
 
 
-def extract_cases(test_source: str, entry_point: str) -> list[dict]:
+def _signature(entry: ast.FunctionDef) -> inspect.Signature:
+    positional = entry.args.posonlyargs + entry.args.args
+    defaults = [inspect.Parameter.empty] * (len(positional) - len(entry.args.defaults))
+    defaults += [_json_value(value, {}) for value in entry.args.defaults]
+    parameters = []
+    for index, (argument, default) in enumerate(zip(positional, defaults)):
+        if isinstance(default, (list, dict)):
+            raise RejectedTask("mutable_reference_default")
+        kind = inspect.Parameter.POSITIONAL_ONLY if index < len(entry.args.posonlyargs) else inspect.Parameter.POSITIONAL_OR_KEYWORD
+        parameters.append(inspect.Parameter(argument.arg, kind, default=default))
+    for argument, value in zip(entry.args.kwonlyargs, entry.args.kw_defaults):
+        default = inspect.Parameter.empty if value is None else _json_value(value, {})
+        if isinstance(default, (list, dict)):
+            raise RejectedTask("mutable_reference_default")
+        parameters.append(inspect.Parameter(argument.arg, inspect.Parameter.KEYWORD_ONLY, default=default))
+    return inspect.Signature(parameters)
+
+
+def _input_key(case: dict, signature: inspect.Signature | None = None) -> str:
+    if signature is None:
+        return content_hash([case["args"], case["kwargs"]])
+    try:
+        bound = signature.bind(*case["args"], **case["kwargs"])
+    except TypeError as error:
+        raise RejectedTask("test_call_signature") from error
+    bound.apply_defaults()
+    return content_hash(bound.arguments)
+
+
+def extract_cases(test_source: str, entry_point: str, reference_entry: ast.FunctionDef | None = None) -> list[dict]:
     """Accept every assertion in a restricted literal-call test file or reject it whole."""
     try:
         tree = ast.parse(test_source)
@@ -96,6 +126,8 @@ def extract_cases(test_source: str, entry_point: str) -> list[dict]:
                 raise RejectedTask("not_direct_function_assertion")
             if any(keyword.arg is None for keyword in call.keywords):
                 raise RejectedTask("unpacked_test_arguments")
+            if len({keyword.arg for keyword in call.keywords}) != len(call.keywords):
+                raise RejectedTask("duplicate_test_keyword")
             for value in ast.walk(comparison):
                 if isinstance(value, ast.Name) and isinstance(names.get(value.id), (list, dict)):
                     mutable_uses[value.id] += 1
@@ -106,7 +138,13 @@ def extract_cases(test_source: str, entry_point: str) -> list[dict]:
                 "kwargs": {keyword.arg: _json_value(keyword.value, names) for keyword in call.keywords},
                 "expected": _json_value(comparison.comparators[0], names),
             })
-    unique = {content_hash(case): case for case in cases}
+    signature = _signature(reference_entry) if reference_entry is not None else None
+    unique = {}
+    for case in cases:
+        key = _input_key(case, signature)
+        if key in unique and content_hash(case["expected"]) != content_hash(unique[key]["expected"]):
+            raise RejectedTask("conflicting_test_expectations")
+        unique.setdefault(key, case)
     if len(unique) < 4:
         raise RejectedTask("fewer_than_four_independent_cases")
     return list(unique.values())
@@ -141,6 +179,7 @@ def inspect_reference(source: str) -> tuple[ast.Module, ast.FunctionDef]:
         raise RejectedTask("reference_toplevel_code")
     if entry.decorator_list or entry.args.vararg or entry.args.kwarg:
         raise RejectedTask("reference_signature")
+    _signature(entry)
     return tree, entry
 
 
@@ -240,11 +279,20 @@ def prepare_pilot(source: Path, output: Path, *, seed: int = 42, max_tasks: int 
     raw = (source / "raw.jsonl").read_bytes()
     if hashlib.sha256(raw).hexdigest() != metadata["raw_sha256"]:
         raise ValueError("Raw data hash mismatch")
+    rows = [json.loads(line) for line in raw.decode().splitlines()]
+    revision = metadata.get("revision", "")
+    if (metadata.get("schema_version") != "1.0" or metadata.get("dataset_id") != DATASET_ID
+            or metadata.get("source_split") != "train" or len(revision) != 40
+            or any(character not in "0123456789abcdef" for character in revision)
+            or metadata.get("rows") != len(rows) or not 1 <= len(rows) <= 100):
+        raise ValueError("Invalid bounded pilot source provenance")
+    source_ids = [row.get("question_id") for row in rows]
+    if any(not isinstance(value, str) or not value for value in source_ids) or len(set(source_ids)) != len(source_ids):
+        raise ValueError("Pilot source IDs must be nonempty and unique")
     output.mkdir(parents=True, exist_ok=False)
     records, bundles, reasons = [], {}, Counter()
     seen_groups, seen_questions = set(), set()
-    for line in raw.decode().splitlines():
-        row = json.loads(line)
+    for row in rows:
         if len(records) >= max_tasks:
             reasons["pilot_limit"] += 1
             continue
@@ -265,7 +313,7 @@ def prepare_pilot(source: Path, output: Path, *, seed: int = 42, max_tasks: int 
             # M1 uses only the provisional train area; M2 must audit near duplicates globally.
             if int(content_hash([seed, group_id])[:8], 16) % 100 >= 80:
                 raise RejectedTask("reserved_non_train_group")
-            cases = extract_cases(row["test"], entry.name)
+            cases = extract_cases(row["test"], entry.name, entry)
             cases.sort(key=lambda case: content_hash([seed, case]))
             public, private = cases[:len(cases)//2], cases[len(cases)//2:]
             mutations = mutation_candidates(row["solution"], seed)
@@ -286,6 +334,7 @@ def prepare_pilot(source: Path, output: Path, *, seed: int = 42, max_tasks: int 
                 bundles[bundle.bundle_id] = bundle.model_dump(mode="json")
             records.append({"task": task.model_dump(mode="json"), "reference_code": row["solution"],
                             "candidates": mutations, "source_test_hash": content_hash(row["test"]),
+                            "source_row_hash": content_hash(row), "source_metadata": row.get("metadata", {}),
                             "status": "pending_execution_validation"})
         except (RejectedTask, SyntaxError) as error:
             reasons[str(error) if isinstance(error, RejectedTask) else "syntax_error"] += 1
@@ -295,6 +344,7 @@ def prepare_pilot(source: Path, output: Path, *, seed: int = 42, max_tasks: int 
     write_json(output / "registry.json", {"schema_version": "1.0", "bundles": list(bundles.values())})
     report = {"schema_version": "1.0", "status": "pending_execution_validation", "source": metadata,
               "seed": seed, "tasks": len(records), "rejected": dict(reasons),
+              "preparation_code_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "limitations": ["Strict literal assertions only; unsupported test files rejected whole.",
                               "Provisional train-only pilot; global near-duplicate and related-ID audit belongs to M2."]}
     report["artifact_hashes"] = {name: hashlib.sha256((output / name).read_bytes()).hexdigest() for name in ("tasks.jsonl", "registry.json")}
@@ -303,11 +353,16 @@ def prepare_pilot(source: Path, output: Path, *, seed: int = 42, max_tasks: int 
 
 
 def load_pilot(directory: Path, *, require_validated: bool = True) -> tuple[list[dict], dict]:
+    from qwen_repair.executors.bundles import load_registry
+
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("schema_version") != "1.0":
         raise ValueError("Unsupported pilot manifest schema")
+    if manifest.get("status") not in {"pending_execution_validation", "validated"}:
+        raise ValueError("Unsupported pilot status")
     if require_validated and manifest.get("status") != "validated":
         raise ValueError("Pilot has not passed real isolated execution validation")
+    validation = None
     if manifest.get("status") == "validated":
         if manifest.get("synthetic_demo") is not False:
             raise ValueError("Validated pilot must record real execution")
@@ -315,38 +370,154 @@ def load_pilot(directory: Path, *, require_validated: bool = True) -> tuple[list
         if (not validation_hash or not (directory / "validation.json").is_file()
                 or hashlib.sha256((directory / "validation.json").read_bytes()).hexdigest() != validation_hash):
             raise ValueError("Pilot validation checksum mismatch")
+        validation = json.loads((directory / "validation.json").read_text(encoding="utf-8"))
+        if validation.get("synthetic_demo") is not False or not isinstance(validation.get("results"), list):
+            raise ValueError("Pilot requires real per-task validation evidence")
     hashes = manifest.get("artifact_hashes", {})
     if set(hashes) != {"tasks.jsonl", "registry.json"}:
         raise ValueError("Invalid pilot artifact inventory")
     for name, expected in hashes.items():
         if hashlib.sha256((directory / name).read_bytes()).hexdigest() != expected:
             raise ValueError(f"Pilot checksum mismatch: {name}")
+    if "review_sha256" in manifest:
+        if hashlib.sha256((directory / "review.json").read_bytes()).hexdigest() != manifest["review_sha256"]:
+            raise ValueError("Pilot review checksum mismatch")
     records = [json.loads(line) for line in (directory / "tasks.jsonl").read_text(encoding="utf-8").splitlines()]
-    if len(records) != manifest["tasks"]:
+    if not records or len(records) != manifest["tasks"]:
         raise ValueError("Pilot record count differs from manifest")
-    seen = set()
+    registry = load_registry(directory / "registry.json")
+    evidence = {}
+    if validation is not None:
+        for result in validation["results"]:
+            task_id = result.get("task_id")
+            if not task_id or task_id in evidence:
+                raise ValueError("Pilot validation task IDs must be unique")
+            evidence[task_id] = result
+    seen, sources, groups = set(), set(), set()
     for record in records:
         task = TaskRecord.model_validate(record["task"])
-        if task.task_id in seen or task.split != "train":
+        if (task.task_id in seen or task.source_id in sources or task.group_id in groups
+                or task.split != "train"):
             raise ValueError("Pilot requires unique train tasks")
         seen.add(task.task_id)
+        sources.add(task.source_id)
+        groups.add(task.group_id)
+        if record.get("status") != manifest.get("status"):
+            raise ValueError("Pilot task status differs from manifest")
+        _, entry = inspect_reference(record["reference_code"])
+        if entry.name != task.entry_point:
+            raise ValueError("Pilot reference entry point differs from task")
+        public = registry.get(task.public_tests_ref)
+        private = registry.get(task.private_tests_ref)
+        if (public.visibility != "public" or private.visibility != "private"
+                or public.entry_point != task.entry_point or private.entry_point != task.entry_point
+                or len(public.cases) < 2 or len(private.cases) < 2):
+            raise ValueError("Pilot requires matching public/private bundles with at least two cases")
+        signature = _signature(entry)
+        keys = [_input_key(case.model_dump(mode="json"), signature) for case in public.cases + private.cases]
+        if len(set(keys)) != len(keys):
+            raise ValueError("Pilot public/private cases must have disjoint independent inputs")
+        if validation is not None:
+            if record.get("candidate_hash") != content_hash(task.buggy_code):
+                raise ValueError("Pilot candidate hash mismatch")
+            result = evidence.get(task.task_id)
+            if result is None or len(result.get("reference", [])) != 4:
+                raise ValueError("Pilot requires two public/private reference repetitions")
+            if manifest.get("validation_evidence_version", 1) >= 2 and not {"reference_hash", "bundle_hashes"} <= result.keys():
+                raise ValueError("Pilot requires reference and bundle hashes in execution evidence")
+            for index, observed in enumerate(result["reference"]):
+                bundle = public if index % 2 == 0 else private
+                _check_validation_result(observed, bundle, "passed")
+            selected = [item for item in result.get("candidates", [])
+                        if item.get("candidate_hash") == record["candidate_hash"]]
+            if len(selected) != 1:
+                raise ValueError("Pilot selected candidate lacks unique execution evidence")
+            _check_validation_result(selected[0]["public"], public, "failed")
+            _check_validation_result(selected[0]["private"], private, "failed")
+            if "reference_hash" in result and result["reference_hash"] != content_hash(record["reference_code"]):
+                raise ValueError("Pilot reference hash differs from execution evidence")
+            if "bundle_hashes" in result and result["bundle_hashes"] != {
+                public.bundle_id: public.bundle_hash, private.bundle_id: private.bundle_hash
+            }:
+                raise ValueError("Pilot bundles differ from execution evidence")
+        else:
+            candidates = record.get("candidates", [])
+            if not candidates or any(item.get("candidate_hash") != content_hash(item["code"]) for item in candidates):
+                raise ValueError("Pilot candidate hash mismatch")
+            if task.buggy_code not in [item["code"] for item in candidates]:
+                raise ValueError("Pilot initial candidate is missing")
     return records, manifest
 
 
-def validate_pilot(source: Path, output: Path, executor_factory) -> dict:
+def _check_validation_result(observed: dict, bundle, expected_status: str) -> None:
+    result = TestResult.model_validate(observed)
+    if (result.synthetic_demo or result.status != expected_status
+            or result.tests_total != len(bundle.cases)):
+        raise ValueError("Pilot execution evidence contradicts the task or test bundle")
+
+
+def review_pilot(source: Path, output: Path, *, decisions: dict[str, dict[str, str]], review_id: str) -> dict:
+    """Select a bounded prepared pilot by explicit source-ID review, without execution."""
+    from qwen_repair.executors.bundles import BundleRegistry, load_registry
+
     records, manifest = load_pilot(source, require_validated=False)
+    if manifest["status"] != "pending_execution_validation":
+        raise ValueError("Review requires a prepared pilot before isolated validation")
+    if (not review_id or set(decisions) != {record["task"]["source_id"] for record in records}
+            or any(item.get("verdict") not in {"include", "exclude"} or not item.get("reason")
+                   for item in decisions.values())):
+        raise ValueError("Review must give every source ID an explicit verdict and reason")
+    selected = [record for record in records if decisions[record["task"]["source_id"]]["verdict"] == "include"]
+    if not selected:
+        raise ValueError("Review did not include any tasks")
+    registry = load_registry(source / "registry.json")
+    bundles = {}
+    for record in selected:
+        for key in ("public_tests_ref", "private_tests_ref"):
+            bundle = registry.get(record["task"][key])
+            bundles[bundle.bundle_id] = bundle
+    output.mkdir(parents=True, exist_ok=False)
+    with (output / "tasks.jsonl").open("x", encoding="utf-8") as stream:
+        for record in selected:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    BundleRegistry(bundles).save(output / "registry.json")
+    write_json(output / "review.json", {"review_id": review_id, "decisions": decisions,
+               "parent_manifest_sha256": hashlib.sha256((source / "manifest.json").read_bytes()).hexdigest()})
+    report = {**manifest, "tasks": len(selected), "review_id": review_id,
+              "review_sha256": hashlib.sha256((output / "review.json").read_bytes()).hexdigest(),
+              "excluded_source_ids": sorted(key for key, value in decisions.items() if value["verdict"] == "exclude")}
+    report["artifact_hashes"] = {name: hashlib.sha256((output / name).read_bytes()).hexdigest()
+                                 for name in ("tasks.jsonl", "registry.json")}
+    write_json(output / "manifest.json", report)
+    return report
+
+
+def validate_pilot(source: Path, output: Path, executor_factory) -> dict:
+    from qwen_repair.executors.bundles import BundleRegistry, load_registry
+
+    records, manifest = load_pilot(source, require_validated=False)
+    if manifest["status"] != "pending_execution_validation":
+        raise ValueError("Execution validation requires a prepared pilot")
+    registry = load_registry(source / "registry.json")
     accepted, reasons, results = [], Counter(), []
     for record in records:
         task = TaskRecord.model_validate(record["task"])
         executor = executor_factory(task)
         if getattr(executor, "synthetic_demo", True):
             raise ValueError("Pilot validation requires a real isolated executor")
-        task_results = {"task_id": task.task_id, "reference": [], "candidates": []}
+        task_results = {"task_id": task.task_id, "reference_hash": content_hash(record["reference_code"]),
+                        "bundle_hashes": {key: registry.get(key).bundle_hash
+                                          for key in (task.public_tests_ref, task.private_tests_ref)},
+                        "executor": {"runner_version": getattr(executor, "runner_version", None),
+                                     "preflight": getattr(executor, "preflight_report", None)},
+                        "reference": [], "candidates": []}
 
         def run(code, bundle):
             result = executor.run(code, bundle)
             if result.synthetic_demo or result.status == "infra_error":
                 raise RuntimeError("Executor unavailable during pilot validation; no data verdict recorded")
+            if result.tests_total != len(registry.get(bundle).cases):
+                raise RuntimeError("Executor test count differs from the trusted bundle")
             return result
 
         reference_passed = True
@@ -368,7 +539,8 @@ def validate_pilot(source: Path, output: Path, executor_factory) -> dict:
                 task = task.model_copy(update={"buggy_code": candidate["code"], "bug_type": candidate["mutation"]["operator"]})
                 accepted.append({"task": task.model_dump(mode="json"), "reference_code": record["reference_code"],
                                  "mutation": candidate["mutation"], "candidate_hash": candidate["candidate_hash"],
-                                 "source_test_hash": record["source_test_hash"], "status": "validated"})
+                                 "source_test_hash": record["source_test_hash"], "status": "validated",
+                                 **{key: record[key] for key in ("source_row_hash", "source_metadata") if key in record}})
                 break
         else:
             reasons["no_public_and_private_failure"] += 1
@@ -379,9 +551,14 @@ def validate_pilot(source: Path, output: Path, executor_factory) -> dict:
     with (output / "tasks.jsonl").open("x", encoding="utf-8") as stream:
         for record in accepted:
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-    (output / "registry.json").write_bytes((source / "registry.json").read_bytes())
+    included_bundles = {record["task"][key]: registry.get(record["task"][key])
+                        for record in accepted for key in ("public_tests_ref", "private_tests_ref")}
+    BundleRegistry(included_bundles).save(output / "registry.json")
+    if "review_sha256" in manifest:
+        (output / "review.json").write_bytes((source / "review.json").read_bytes())
     report = {**manifest, "status": "validated", "synthetic_demo": False, "tasks": len(accepted),
-              "validation_rejected": dict(reasons), "reference_repetitions": 2}
+              "validation_rejected": dict(reasons), "reference_repetitions": 2, "validation_evidence_version": 2,
+              "validation_code_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
     report["artifact_hashes"] = {name: hashlib.sha256((output / name).read_bytes()).hexdigest() for name in ("tasks.jsonl", "registry.json")}
     write_json(output / "validation.json", {"synthetic_demo": False, "results": results})
     report["validation_sha256"] = hashlib.sha256((output / "validation.json").read_bytes()).hexdigest()

@@ -1,6 +1,8 @@
 import hashlib
 import importlib.metadata
 import json
+import os
+import platform
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -129,13 +131,18 @@ def verify_checkpoint(directory: str | Path, config=None, *, allow_test_checkpoi
         raise ValueError("Checkpoint is missing optimizer, scheduler, RNG or trainer state")
     if file_hashes(directory) != payload["files"]:
         raise ValueError("Checkpoint file inventory or checksum mismatch")
+    if "global_step" in payload:
+        step = payload["global_step"]
+        trainer_state = json.loads((directory / "trainer_state.json").read_text())
+        if type(step) is not int or step < 1 or trainer_state.get("global_step") != step:
+            raise ValueError("Checkpoint step does not match the saved trainer state")
     provenance = payload.get("provenance")
     if not allow_test_checkpoint:
         required_provenance = {"source_hashes", "fixture_hashes", "versions", "executors"}
         if not isinstance(provenance, dict) or any(not provenance.get(key) for key in required_provenance):
             raise ValueError("Production checkpoint requires complete provenance")
-        if not payload.get("run_id") or not isinstance(payload.get("scaler_required"), bool):
-            raise ValueError("Production checkpoint requires run identity and scaler metadata")
+        if not payload.get("run_id") or "global_step" not in payload or not isinstance(payload.get("scaler_required"), bool):
+            raise ValueError("Production checkpoint requires run identity, step and scaler metadata")
         if payload.get("resolved_dtype") not in {"float32", "bfloat16", "float16"}:
             raise ValueError("Production checkpoint requires its resolved dtype")
         if config is not None and hasattr(config, "sft_adapter") and not provenance.get("initial_sft_adapter_hashes"):
@@ -166,6 +173,71 @@ def checkpoint_callback(config, *, allow_test_checkpoint=False):
     class CompletedCheckpoint(TrainerCallback):
         scaler_getter = None
 
+        def on_train_begin(self, args, state, control, model, **kwargs):
+            self.initial_parameters = self.snapshot(model)
+            if not self.initial_parameters:
+                raise ValueError("Training requires trainable adapter parameters")
+            self.previous_parameters = self.initial_parameters
+            self.steps = []
+            return control
+
+        @staticmethod
+        def snapshot(model):
+            values = {name: parameter.detach().float().cpu().clone()
+                      for name, parameter in model.named_parameters() if parameter.requires_grad}
+            if any(not value.isfinite().all().item() for value in values.values()):
+                raise RuntimeError("Nonfinite trainable parameters; training cannot be validated")
+            return values
+
+        @staticmethod
+        def digest(values):
+            digest = hashlib.sha256()
+            for name, value in sorted(values.items()):
+                digest.update(name.encode())
+                digest.update(str(tuple(value.shape)).encode())
+                digest.update(value.numpy().tobytes())
+            return digest.hexdigest()
+
+        @staticmethod
+        def max_delta(before, after):
+            return max((after[name] - value).abs().max().item() for name, value in before.items())
+
+        def on_pre_optimizer_step(self, args, state, control, model, **kwargs):
+            gradients = [parameter.grad.detach() for parameter in model.parameters()
+                         if parameter.requires_grad and parameter.grad is not None]
+            self.gradients_finite = all(gradient.isfinite().all().item() for gradient in gradients)
+            self.nonzero_gradients = self.gradients_finite and any(gradient.ne(0).any().item() for gradient in gradients)
+            return control
+
+        def on_optimizer_step(self, args, state, control, model, optimizer, **kwargs):
+            current = self.snapshot(model)
+            delta = self.max_delta(self.previous_parameters, current)
+            self.steps.append({
+                "global_step": state.global_step + 1,
+                "skipped": bool(getattr(optimizer, "step_was_skipped", False)),
+                "gradients_finite": self.gradients_finite,
+                "nonzero_gradients": self.nonzero_gradients,
+                "parameters_changed": delta > 0,
+                "max_abs_parameter_delta": delta,
+            })
+            self.previous_parameters = current
+            return control
+
+        def summary(self):
+            delta = self.max_delta(self.initial_parameters, self.previous_parameters)
+            skipped = sum(step["skipped"] for step in self.steps)
+            return {
+                "scope": "current_process_segment", "attempted": len(self.steps),
+                "skipped": skipped, "applied": len(self.steps) - skipped,
+                "nonzero_gradient_steps": sum(step["nonzero_gradients"] and not step["skipped"] for step in self.steps),
+                "nonfinite_gradient_steps": sum(not step["gradients_finite"] for step in self.steps),
+                "parameter_change_steps": sum(step["parameters_changed"] for step in self.steps),
+                "trainable_parameters_changed": delta > 0, "max_abs_parameter_delta": delta,
+                "trainable_parameter_count": sum(value.numel() for value in self.initial_parameters.values()),
+                "before_sha256": self.digest(self.initial_parameters),
+                "after_sha256": self.digest(self.previous_parameters), "steps": self.steps,
+            }
+
         def on_step_end(self, args, state, control, **kwargs):
             if config.stop_after_steps is not None and state.global_step >= config.stop_after_steps:
                 control.should_training_stop = True
@@ -183,6 +255,7 @@ def checkpoint_callback(config, *, allow_test_checkpoint=False):
                 "run_id": run_id,
                 "scaler_required": scaler_required,
                 "resolved_dtype": "float16" if args.fp16 else "bfloat16" if args.bf16 else "float32",
+                "optimizer_updates": self.summary(),
                 "provenance": {key: manifest[key] for key in (
                     "source_hashes", "fixture_hashes", "versions", "initial_sft_adapter_hashes", "executors"
                 ) if key in manifest},
@@ -212,14 +285,22 @@ def begin_run(config, output: Path, resume_from, method: str):
         torch.cuda.reset_peak_memory_stats()
     if resume_from:
         restored = verify_checkpoint(resume_from, config, expected_dtype=dtype_name)
+        if restored["global_step"] >= config.max_steps:
+            raise ValueError("The checkpoint already reached the planned step horizon")
+        if config.stop_after_steps is not None and config.stop_after_steps <= restored["global_step"]:
+            raise ValueError("stop_after_steps must exceed the resumed checkpoint step")
         if output.exists():
             manifest_path = output / "manifest.json"
             if not manifest_path.exists() or json.loads(manifest_path.read_text()).get("kind") != "training":
                 raise ValueError("Existing resume output is not a training run directory")
+            previous = json.loads(manifest_path.read_text())
+            if previous.get("run_id") != restored["run_id"] or previous.get("method") != method:
+                raise ValueError("Resume output belongs to a different training run")
         output.mkdir(parents=True, exist_ok=True)
     else:
         restored = {}
         output.mkdir(parents=True, exist_ok=False)
+    segment_id = uuid4().hex
     (output / "training_complete.json").unlink(missing_ok=True)
     environment = inspect_environment(config)
     environment.update(synthetic_demo=False, dependencies=versions, token_count_method="tokenizer")
@@ -235,6 +316,8 @@ def begin_run(config, output: Path, resume_from, method: str):
     write_json(output / "manifest.json", {
         "schema_version": "1.0", "kind": "training", "method": method,
         "run_id": restored.get("run_id") or uuid4().hex,
+        "segment_id": segment_id,
+        "process_id": os.getpid(), "hostname": platform.node(),
         "synthetic_demo": False, "status": "running",
         "started_at": datetime.now(timezone.utc).isoformat(),
         "package_version": __version__, **git_state(Path.cwd()),
@@ -249,6 +332,7 @@ def begin_run(config, output: Path, resume_from, method: str):
     })
     write_json(output / "training_status.json", {
         "schema_version": "1.0", "method": method, "status": "running",
+        "segment_id": segment_id,
         "synthetic_demo": False, "config": config.model_dump(),
         "versions": versions, "resume_from": str(resume_from) if resume_from else None,
         "segment_start_step": restored.get("global_step", 0),
@@ -267,13 +351,18 @@ def finish_run(config, output, trainer, started, dtype_name, **extra):
     })
     status = json.loads((output / "training_status.json").read_text())
     segment_start_step = status["segment_start_step"]
+    evidence = getattr(trainer, "repair_training_evidence", None)
+    optimizer_updates = evidence.summary() if evidence is not None else None
     summary = {
         "schema_version": "1.0", "synthetic_demo": False,
         "status": "paused_at_checkpoint" if trainer.state.global_step < config.max_steps else "completed",
         "global_step": trainer.state.global_step, "planned_steps": config.max_steps,
         "global_step_scope": "cumulative", "metrics_scope": "current_process_segment",
         "segment_start_step": segment_start_step,
-        "optimizer_steps_in_segment": trainer.state.global_step - segment_start_step,
+        "segment_id": status.get("segment_id", uuid4().hex),
+        "trainer_steps_in_segment": trainer.state.global_step - segment_start_step,
+        "optimizer_steps_in_segment": optimizer_updates["applied"] if optimizer_updates is not None else None,
+        "optimizer_updates": optimizer_updates,
         "duration_seconds": perf_counter() - started, "dtype": dtype_name,
         "peak_vram_bytes": torch.cuda.max_memory_allocated() if config.device == "cuda" else None,
         "training_log": [entry for entry in trainer.state.log_history if entry.get("step", -1) > segment_start_step], **extra,
@@ -338,6 +427,16 @@ def seal_training_run(output: Path, result):
     manifest = json.loads((output / "manifest.json").read_text())
     manifest.update(status=result["status"], completed_at=datetime.now(timezone.utc).isoformat(), performance=result)
     write_json(output / "manifest.json", manifest)
+    segment_directory = output / "segments"
+    segment_directory.mkdir(exist_ok=True)
+    with (segment_directory / f"{result['segment_id']}.json").open("x", encoding="utf-8") as stream:
+        json.dump({
+            "schema_version": "1.0", "synthetic_demo": False,
+            "run_id": manifest["run_id"], "segment_id": result["segment_id"],
+            "result": result, "manifest": manifest,
+            "environment": json.loads((output / "environment.json").read_text()),
+        }, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
     inventory = file_hashes(output, ignored=frozenset({"training_complete.json"}))
     atomic_json(output / "training_complete.json", {
         "schema_version": "1.0", "run_id": manifest["run_id"],

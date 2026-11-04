@@ -2,6 +2,16 @@ from pathlib import Path
 
 
 def add_arguments(commands):
+    audit = commands.add_parser("training-audit", help="Verify sealed GPU training and resume evidence on CPU")
+    audit.add_argument("--run", required=True, type=Path)
+    audit.add_argument("--output", type=Path)
+    publish = commands.add_parser("training-export", help="Copy a sealed training run to persistent storage")
+    publish.add_argument("--run", required=True, type=Path)
+    publish.add_argument("--destination", required=True, type=Path)
+    publish.add_argument("--output", type=Path, help="Optional transfer receipt outside the sealed run")
+    restore = commands.add_parser("training-import", help="Verify and restore a complete training archive")
+    restore.add_argument("--bundle", required=True, type=Path)
+    restore.add_argument("--output", required=True, type=Path)
     preflight = commands.add_parser("executor-preflight", help="Probe the selected isolated executor")
     preflight.add_argument("--config", required=True, type=Path)
     preflight.add_argument("--registry", type=Path)
@@ -53,6 +63,23 @@ def _save_report(path, report):
 
 
 def run_command(args):
+    if args.command == "training-audit":
+        from qwen_repair.training_audit import audit_training
+        if args.output and args.output.resolve().is_relative_to(args.run.resolve()):
+            raise ValueError("Audit output must be outside the sealed training run")
+        report = audit_training(args.run)
+        _save_report(args.output, report)
+        return report
+    if args.command == "training-export":
+        from qwen_repair.artifact_transfer import publish_training
+        if args.output and args.output.resolve().is_relative_to(args.run.resolve()):
+            raise ValueError("Transfer receipt must be outside the sealed training run")
+        report = publish_training(args.run, args.destination)
+        _save_report(args.output, report)
+        return report
+    if args.command == "training-import":
+        from qwen_repair.artifact_transfer import restore_training
+        return restore_training(args.bundle, args.output)
     from time import perf_counter, sleep
     from uuid import uuid4
 

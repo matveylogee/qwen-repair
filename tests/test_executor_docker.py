@@ -105,6 +105,42 @@ def test_json_comparison_preserves_python_numeric_equality(monkeypatch):
     assert executor.run("def solve(x): return x", "public").status == "passed"
 
 
+@pytest.mark.parametrize("exit_code", [125, 126, 127, 137])
+def test_attached_candidate_exit_codes_require_container_inspection(monkeypatch, exit_code):
+    stdin_read, stdin_write = os.pipe()
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    os.close(stdout_write)
+    os.close(stderr_write)
+    process = SimpleNamespace(
+        stdin=os.fdopen(stdin_write, "wb"), stdout=os.fdopen(stdout_read, "rb"),
+        stderr=os.fdopen(stderr_read, "rb"), poll=lambda: exit_code, wait=lambda **kwargs: exit_code,
+    )
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+    try:
+        result = executor_for()._capture(["docker", "start", "unit-container"], b"{}")
+    finally:
+        os.close(stdin_read)
+    assert result.status == "runtime_error"
+
+
+@pytest.mark.parametrize("state,expected_status", [
+    ({"Status": "exited", "ExitCode": 125, "OOMKilled": False, "Error": ""}, "runtime_error"),
+    ({"Status": "exited", "ExitCode": 137, "OOMKilled": False, "Error": ""}, "runtime_error"),
+    ({"Status": "exited", "ExitCode": 137, "OOMKilled": True, "Error": ""}, "resource_limit"),
+    ({"Status": "created", "ExitCode": 0, "OOMKilled": False, "Error": ""}, "infra_error"),
+    ({"Status": "exited", "ExitCode": 0, "OOMKilled": False, "Error": ""}, "infra_error"),
+    (None, "infra_error"),
+])
+def test_candidate_and_docker_cli_failures_use_container_state(monkeypatch, state, expected_status):
+    executor = executor_for()
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(executor, "_capture", lambda *args: ContainerOutput("runtime_error"))
+    monkeypatch.setattr(executor, "_container_state", lambda _: state)
+    result = executor._execute_case("def solve(x): return x", "solve", TestCase(args=[1], expected=7))
+    assert result.status == expected_status
+
+
 def test_cleanup_failure_revokes_preflight(monkeypatch):
     executor = executor_for()
     executor._preflight_passed = True
@@ -171,3 +207,6 @@ def test_real_docker_preflight_and_authored_reference():
     fixture = load_fixture("sum_positive")
     assert executor.run(fixture.reference_code, fixture.task.public_tests_ref).status == "passed"
     assert executor.run(fixture.task.buggy_code, fixture.task.private_tests_ref).status == "failed"
+    for exit_code in (125, 126, 127, 137):
+        candidate = f"def sum_positive(values):\n    import os\n    os._exit({exit_code})\n"
+        assert executor.run(candidate, fixture.task.public_tests_ref).status == "runtime_error"

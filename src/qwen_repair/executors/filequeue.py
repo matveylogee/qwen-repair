@@ -184,8 +184,16 @@ class FileQueueExecutor:
             limits=self.limits, limits_hash=sha256(canonical_json(self.limits)).hexdigest(),
             deadline=time.time() + self.deadline_seconds,
         )
-        self.redeliver(request)
         self.pending.add(request.request_id)
+        try:
+            self.redeliver(request)
+        except BaseException:
+            try:
+                self.cancel(request.request_id)
+            except (OSError, ValueError):
+                pass
+            self.pending.discard(request.request_id)
+            raise
         return request
 
     def redeliver(self, request: QueueRequest) -> None:
@@ -231,6 +239,13 @@ class FileQueueExecutor:
                 time.sleep(min(self.poll_interval, max(0, deadline - time.monotonic())))
             self.cancel(request.request_id)
             return _infra("Queue deadline exceeded; request cancelled.")
+        except KeyboardInterrupt:
+            if request is not None:
+                try:
+                    self.cancel(request.request_id)
+                except (OSError, ValueError):
+                    pass
+            raise
         except (OSError, ValueError, TypeError):
             if request is not None:
                 try:

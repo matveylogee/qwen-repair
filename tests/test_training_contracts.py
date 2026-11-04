@@ -1,4 +1,6 @@
 import json
+import os
+import platform
 import sys
 from types import SimpleNamespace
 
@@ -7,8 +9,8 @@ import pytest
 from qwen_repair.data.fixtures import load_fixture
 from qwen_repair.schemas import TestResult
 from qwen_repair.training.common import (
-    TrainingInfrastructureError, checked_executor, device_dtype, file_hashes, require_real_result,
-    verify_checkpoint,
+    TrainingInfrastructureError, begin_run, checked_executor, device_dtype, file_hashes, require_real_result,
+    seal_training_run, verify_checkpoint,
 )
 from qwen_repair.training.config import GRPOConfig, SFTConfig
 from qwen_repair.training.grpo import MultiTurnRollout
@@ -139,6 +141,26 @@ def test_infra_failure_cancels_episode_before_reward(tmp_path):
     assert len(judge.calls) == 1
 
 
+def test_grpo_uses_last_attempt_even_when_previous_attempt_passed(tmp_path):
+    fixture, tokenizer = load_fixture("sum_positive"), ToyTokenizer()
+    judge = TestJudge(fixture)
+    rollout = MultiTurnRollout(tokenizer, [fixture], [judge], GRPOConfig(sft_adapter="unused", device="cpu"), tmp_path)
+    responses = iter([f"```python\n{fixture.corrected_code}\n```", "No valid candidate"])
+
+    def sample(model, prompt):
+        ids = tokenizer.encode(next(responses))
+        return ids, [-1.0] * len(ids)
+
+    rollout._sample = sample
+    episode = rollout._episode(None, rollout.rows[0]["prompt"], fixture, judge, "step-0")
+    assert len(episode["attempts"]) == 2
+    assert episode["attempts"][0]["public_result"]["status"] == "passed"
+    assert episode["attempts"][1]["parse_error"] is not None
+    assert episode["reward"] == 0
+    assert episode["private_result"] is None
+    assert [bundle for _, bundle in judge.calls] == [fixture.task.public_tests_ref]
+
+
 def test_checkpoint_rejects_incomplete_tampered_or_changed_training_state(tmp_path):
     config = SFTConfig(device="cpu")
     with pytest.raises(FileNotFoundError):
@@ -179,6 +201,90 @@ def test_checkpoint_requires_active_fp16_scaler_state(tmp_path):
     assert verify_checkpoint(tmp_path, config, allow_test_checkpoint=True) == payload
     with pytest.raises(ValueError, match="dtype differs"):
         verify_checkpoint(tmp_path, config, allow_test_checkpoint=True, expected_dtype="bfloat16")
+
+
+def test_checkpoint_marker_step_must_match_trainer_state(tmp_path):
+    config = SFTConfig(device="cpu")
+    for name in ("optimizer.pt", "scheduler.pt", "rng_state.pth", "adapter_config.json", "adapter_model.safetensors"):
+        (tmp_path / name).write_bytes(b"test checkpoint bytes")
+    (tmp_path / "trainer_state.json").write_text(json.dumps({"global_step": 1}))
+    payload = {"config": config.model_dump(exclude={"stop_after_steps"}), "files": file_hashes(tmp_path), "global_step": 2}
+    marker = tmp_path / "checkpoint_complete.json"
+    marker.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="step does not match"):
+        verify_checkpoint(tmp_path, config, allow_test_checkpoint=True)
+    payload["global_step"] = 1
+    marker.write_text(json.dumps(payload))
+    assert verify_checkpoint(tmp_path, config, allow_test_checkpoint=True) == payload
+
+
+@pytest.mark.parametrize("run_id,method", [("unrelated", "sft"), ("source-run", "grpo_fixed_two_turn")])
+def test_resume_cannot_overwrite_a_different_training_run(tmp_path, monkeypatch, run_id, method):
+    import qwen_repair.training.common as common
+
+    manifest = {"kind": "training", "run_id": run_id, "method": method}
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    (tmp_path / "training_complete.json").write_text("existing completion marker")
+    before = file_hashes(tmp_path, ignored=frozenset())
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    monkeypatch.setattr(common, "check_ml_versions", lambda: {})
+    monkeypatch.setattr(common, "device_dtype", lambda config: (None, "float32"))
+    monkeypatch.setattr(common, "verify_checkpoint", lambda *args, **kwargs: {"run_id": "source-run", "global_step": 1})
+    with pytest.raises(ValueError, match="different training run"):
+        begin_run(SFTConfig(device="cpu"), tmp_path, "checkpoint-1", "sft")
+    assert file_hashes(tmp_path, ignored=frozenset()) == before
+
+
+def test_begin_run_records_process_and_segment_identity(tmp_path, monkeypatch):
+    import qwen_repair.training.common as common
+    import qwen_repair.doctor as doctor
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(version=SimpleNamespace(cuda=None)))
+    monkeypatch.setattr(common, "check_ml_versions", lambda: {})
+    monkeypatch.setattr(common, "device_dtype", lambda config: (None, "float32"))
+    monkeypatch.setattr(doctor, "inspect_environment", lambda config: {})
+    monkeypatch.setattr(doctor, "git_state", lambda path: {})
+    output = tmp_path / "run"
+    begin_run(SFTConfig(device="cpu"), output, None, "sft")
+    manifest = json.loads((output / "manifest.json").read_text())
+    status = json.loads((output / "training_status.json").read_text())
+    assert manifest["process_id"] == os.getpid()
+    assert manifest["hostname"] == platform.node()
+    assert manifest["segment_id"] == status["segment_id"]
+    assert len(manifest["segment_id"]) == 32
+
+
+@pytest.mark.parametrize("global_step,stop_after_steps,message", [
+    (2, None, "already reached"), (1, 1, "must exceed"),
+])
+def test_resume_requires_remaining_steps(tmp_path, monkeypatch, global_step, stop_after_steps, message):
+    import qwen_repair.training.common as common
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    monkeypatch.setattr(common, "check_ml_versions", lambda: {})
+    monkeypatch.setattr(common, "device_dtype", lambda config: (None, "float32"))
+    monkeypatch.setattr(common, "verify_checkpoint", lambda *args, **kwargs: {"run_id": "run", "global_step": global_step})
+    output = tmp_path / "new-run"
+    with pytest.raises(ValueError, match=message):
+        begin_run(SFTConfig(device="cpu", stop_after_steps=stop_after_steps), output, "checkpoint", "sft")
+    assert not output.exists()
+
+
+def test_sealed_segments_preserve_previous_training_evidence(tmp_path):
+    (tmp_path / "environment.json").write_text(json.dumps({"gpu": {"status": "cpu_profile"}}))
+    (tmp_path / "manifest.json").write_text(json.dumps({"run_id": "same-run"}))
+    first = {"status": "paused_at_checkpoint", "segment_id": "first", "global_step": 1, "duration_seconds": 3.0}
+    seal_training_run(tmp_path, first)
+    first_path = tmp_path / "segments/first.json"
+    first_bytes = first_path.read_bytes()
+    second = {"status": "completed", "segment_id": "second", "global_step": 2, "duration_seconds": 4.0}
+    seal_training_run(tmp_path, second)
+    assert first_path.read_bytes() == first_bytes
+    assert json.loads(first_bytes)["result"] == first
+    assert json.loads((tmp_path / "segments/second.json").read_text())["result"] == second
+    sealed = json.loads((tmp_path / "training_complete.json").read_text())
+    assert sealed["files"] == file_hashes(tmp_path, ignored=frozenset({"training_complete.json"}))
+    assert {"segments/first.json", "segments/second.json"}.issubset(sealed["files"])
 
 
 def stub_trainer():

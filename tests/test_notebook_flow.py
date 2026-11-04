@@ -122,7 +122,7 @@ def notebook_harness(tmp_path, monkeypatch, *, inference=False, training=False, 
             output = Path(command[command.index("--output") + 1])
             if output.suffix == ".json":
                 output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_text(json.dumps({"passed": True}))
+                output.write_text(json.dumps({"passed": True, "bundle": str(tmp_path / "persistent" / "bundle")}))
             else:
                 output.mkdir(parents=True, exist_ok=True)
                 (output / "training_result.json").write_text("{}")
@@ -193,7 +193,30 @@ def test_training_opt_in_uses_separate_stop_and_resume_calls(tmp_path, monkeypat
         assert len(stages) == 2
         assert stages[0][-2:] == ["--stop-after", "1"]
         assert "--resume-from" in stages[1]
+        assert "-restored/checkpoint-1" in stages[1][-1]
+    assert sum("training-export" in call for call in calls) == 4
+    assert sum("training-import" in call for call in calls) == 2
+    assert sum("training-audit" in call for call in calls) == 2
     assert all("infer" not in call for call in calls)
+
+
+def test_reuse_environment_preserves_existing_interpreter_and_requires_new_checkout(tmp_path, monkeypatch):
+    cells, namespace, calls, _ = notebook_harness(tmp_path, monkeypatch)
+    python = Path(namespace["ENV_DIR"]) / "bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text("existing interpreter")
+    namespace["REUSE_ENV"] = True
+    run_cells(cells, namespace)
+    assert not any("venv" in call for call in calls)
+    assert python.read_text() == "existing interpreter"
+    assert any("install" in call for call in calls)
+
+
+def test_failed_persistent_copy_prevents_resume(tmp_path, monkeypatch):
+    cells, namespace, calls, _ = notebook_harness(tmp_path, monkeypatch, training=True, failed_command="training-import")
+    with pytest.raises(subprocess.CalledProcessError):
+        run_cells(cells, namespace)
+    assert not any("--resume-from" in call for call in calls)
 
 
 @pytest.mark.parametrize("session", ["", "../other", "/absolute", "with/slash"])
