@@ -1,6 +1,6 @@
 # Qwen Code Repair
 
-Проект содержит синтетический CPU-прототип M0 и реализацию коротких проверок M1: Qwen inference, Docker executor, файловую очередь, LoRA SFT и multi-turn TRL GRPO. Локальные проверки Docker и trainer выполнены; запуск Qwen на T4 и удалённую связь Colab с Mac нужно подтвердить отдельно. Обмен между Colab и Docker worker на Mac выполняется через Google Drive. Инструкции: [M1](docs/m1.md), [результаты проверок](docs/m1_validation.md).
+Проект содержит синтетический CPU-прототип M0 и реализацию коротких проверок M1: Qwen inference, Docker executor, файловую очередь, LoRA SFT и multi-turn TRL GRPO. Локальные проверки Docker и trainer выполнены, первый удалённый CPU probe Colab → Drive → Mac Docker прошёл 2/2 теста; повторные измерения задержки и запуск Qwen на T4 ещё впереди. Обмен между Colab и Docker worker на Mac выполняется через Google Drive. Инструкции: [M1](docs/m1.md), [результаты проверок](docs/m1_validation.md).
 
 M0 проверяет протокол исправления Python-кода на CPU: подготовленный ответ, публичная обратная связь, следующая попытка, отдельная скрытая оценка и сохранение артефактов. `ScriptedPolicy` возвращает заданные строки, а `FakeExecutor` ищет заранее записанный результат. Код кандидатов и тестовые случаи не исполняются.
 
