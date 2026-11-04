@@ -16,6 +16,16 @@
 
 Итог основной команды `.venv/bin/python -m pytest -q --tb=short`: **212 passed, 3 skipped**, 6,51 с. Пропуски относятся к optional tiny ML, Docker и tokenizer; они дополнительно проверены отдельными командами: 6 ML CPU-тестов, реальный Docker integration и локальный pinned tokenizer. В ML был ожидаемый warning об экспериментальном `rollout_func`. CPU doctor, demo и summarize завершились с кодом 0, артефакты `runs/m1-hardening-72ee04b9db/`. `git diff --check` прошёл.
 
+## Сокращение ожиданий очереди после отключения T4 runtime
+
+Подготовленный worker `m1-training-20261104-2298e400` остановлен после сообщения пользователя об отключении runtime: exit 0, обработанных запросов 0. GPU training не начинался.
+
+Независимые authored-проверки теперь публикуются пачкой, с сохранением исходных дедлайнов и отменой оставшихся запросов при инфраструктурной ошибке. Результаты reference/target/buggy привязаны к точному коду, registry, runner/profile и проверенному checkpoint. Resume использует эту копию, повторные model rollouts всегда выполняются заново. Для стандартных конфигов подсчёт уменьшился с 41 последовательного обращения до 27 запросов примерно в 15 последовательных ожиданиях. Это подсчёт протокола, не измерение скорости Drive; основной online RL всё ещё требует другого транспорта.
+
+Проверки после изменения: **245 passed, 3 skipped**, 6,80 с в базовом окружении. Отдельно **47 passed** в закреплённом ML-окружении (training/cache/контракты, включая шесть tiny CPU integration), 26,37 с, с ожидаемым warning TRL. Настоящий Docker с локальной файловой очередью выполнил batch из трёх проверок за 1,7333 с: public/reference passed, private/reference passed, private/buggy failed. Все три READY опубликованы до первого ожидания; pending после завершения пуст. Это локальный тест, не Colab/Drive benchmark. Артефакт: `runs/m1-batch-local-20261104-1/report.json`.
+
+CPU doctor, M0 demo и summarize прошли повторно, результаты `runs/m1-batch-cache-regression-939455144f/`; `git diff --check` прошёл. Расчёт ожиданий на основе прежних задержек, без выдачи их за новый замер: `runs/m1-queue-latency-estimate-20261104-c685a5a64b/estimate.json`.
+
 Suite 29 октября: **124 passed** за 38,95 с, включая настоящий Docker, закреплённый tokenizer и tiny CPU training/resume. TRL выдал ожидаемое предупреждение об экспериментальном `rollout_func`; API закреплён и проверен. `pip check` в обоих окружениях не обнаружил конфликтов. Wheel собран и установлен отдельно от checkout: все 38 исходных файлов и fixtures совпали побайтно, CLI help и M0 demo/summarize прошли.
 
 ## Выполнено локально

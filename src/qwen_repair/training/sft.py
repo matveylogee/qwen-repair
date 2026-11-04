@@ -12,6 +12,7 @@ from .common import (
     finish_run, load_base, require_real_result,
     record_executors, seal_training_run,
 )
+from .validation import validate_authored
 
 
 def bounded_feedback(tokenizer, result, max_tokens: int) -> str:
@@ -40,15 +41,20 @@ def supervised_record(tokenizer, prompt_ids: list[int], target: str, max_context
     }
 
 
-def build_sft_records(tokenizer, fixtures, executors, config):
+def build_sft_records(tokenizer, fixtures, executors, config, validation_results=None):
     records, audit = [], []
     for fixture, executor in zip(fixtures, executors, strict=True):
         task = fixture.task
+        def checked_result(role, code, bundle):
+            result = (validation_results[(task.task_id, role, bundle)] if validation_results is not None
+                      else executor.run(code, bundle))
+            return require_real_result(result)
+
         for bundle in (task.public_tests_ref, task.private_tests_ref):
-            reference_result = require_real_result(executor.run(fixture.reference_code, bundle))
+            reference_result = checked_result("reference", fixture.reference_code, bundle)
             if reference_result.status != "passed":
                 raise ValueError(f"Authored reference does not pass its trusted tests: {task.task_id}")
-            result = require_real_result(executor.run(fixture.corrected_code, bundle))
+            result = checked_result("target", fixture.corrected_code, bundle)
             if result.status != "passed":
                 raise ValueError(f"Authored target does not pass its trusted tests: {task.task_id}")
         conversation = TokenConversation.start(tokenizer, build_initial_messages(PromptView.from_task(task)))
@@ -57,7 +63,7 @@ def build_sft_records(tokenizer, fixtures, executors, config):
         records.append(one_shot)
         audit.append({"task_id": task.task_id, "kind": "one_shot", **one_shot})
         if config.include_recovery:
-            result = require_real_result(executor.run(task.buggy_code, task.public_tests_ref))
+            result = checked_result("buggy", task.buggy_code, task.public_tests_ref)
             if result.status == "passed":
                 raise ValueError("Recovery supervision requires an actually failing public attempt")
             bad_answer = f"```python\n{task.buggy_code}\n```"
@@ -146,9 +152,10 @@ def run_sft_smoke(config, output, resume_from=None, executor=None):
         fixtures = [load_fixture(name) for name in config.fixture_names]
         executors = [checked_executor(executor, fixture.task) for fixture in fixtures]
         record_executors(output, fixtures, executors)
+        validation_results = validate_authored(fixtures, executors, config, output, "sft", resume_from)
         model, tokenizer, dtype_name = load_base(config)
         model = add_lora(model, config.lora_rank)
-        records, audit = build_sft_records(tokenizer, fixtures, executors, config)
+        records, audit = build_sft_records(tokenizer, fixtures, executors, config, validation_results)
         write_json(output / "supervision_audit.json", {"synthetic_demo": False, "examples": audit})
         trainer = make_sft_trainer(model, tokenizer, records, config, output, dtype_name)
         trainer.train(resume_from_checkpoint=str(resume_from) if resume_from else None)

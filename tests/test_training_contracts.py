@@ -94,6 +94,21 @@ def test_sft_only_target_tokens_receive_labels_including_recovery():
         supervised_record(tokenizer, [1] * 100, "target", 50)
 
 
+def test_sft_records_reuse_validated_authored_results_without_executor_calls():
+    fixture, tokenizer = load_fixture("sum_positive"), ToyTokenizer()
+    judge = TestJudge(fixture)
+    task = fixture.task
+    validated = {(task.task_id, role, bundle): judge.run(code, bundle)
+                 for bundle in (task.public_tests_ref, task.private_tests_ref)
+                 for role, code in (("reference", fixture.reference_code), ("target", fixture.corrected_code))}
+    validated[(task.task_id, "buggy", task.public_tests_ref)] = judge.run(task.buggy_code, task.public_tests_ref)
+    judge.calls.clear()
+    records, audit = build_sft_records(tokenizer, [fixture], [judge], SFTConfig(device="cpu"), validated)
+    assert len(records) == 2
+    assert [item["kind"] for item in audit] == ["one_shot", "recovery"]
+    assert judge.calls == []
+
+
 def test_real_training_rejects_synthetic_results_and_missing_isolation():
     with pytest.raises(TrainingInfrastructureError, match="Synthetic"):
         require_real_result(TestResult(status="passed", tests_total=1, tests_passed=1))

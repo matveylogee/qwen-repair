@@ -116,6 +116,30 @@ def test_keyboard_interrupt_cancels_the_published_request(tmp_path, monkeypatch,
     assert executor.calls == []
 
 
+@pytest.mark.parametrize("delay", [115, 121])
+def test_wait_uses_the_original_submission_deadline(tmp_path, monkeypatch, delay):
+    from qwen_repair.executors import filequeue
+
+    client, _, executor = queue_pair(tmp_path)
+    clock = [time.time(), 100.0]
+    monkeypatch.setattr(filequeue.time, "time", lambda: clock[0])
+    monkeypatch.setattr(filequeue.time, "monotonic", lambda: clock[1])
+
+    def advance(seconds):
+        clock[0] += seconds
+        clock[1] += seconds
+
+    monkeypatch.setattr(filequeue.time, "sleep", advance)
+    request = client.submit("candidate", "sum_positive.public.v1")
+    advance(delay)
+    started = clock[1]
+    assert client.wait(request).status == "infra_error"
+    assert clock[1] - started == pytest.approx(max(0, 120 - delay))
+    assert read_message(tmp_path / "cancellations" / request.request_id)["cancelled"] is True
+    assert not client.pending
+    assert executor.calls == []
+
+
 def test_changed_resource_limits_rejected_by_worker(tmp_path):
     client, worker, executor = queue_pair(tmp_path)
     client.limits["memory_mb"] = 4096

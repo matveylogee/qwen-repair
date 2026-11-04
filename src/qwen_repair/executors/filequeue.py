@@ -221,15 +221,12 @@ class FileQueueExecutor:
             raise QueueProtocolError("A synthetic result cannot satisfy a real queue request")
         return response.result
 
-    def run(self, candidate: str, test_bundle_id: str) -> TestResult:
-        if not self.preflight()["passed"]:
-            return _infra("No single fresh compatible worker with successful Docker preflight.")
-        request = None
+    def wait(self, request: QueueRequest) -> TestResult:
         try:
-            request = self.submit(candidate, test_bundle_id)
-            deadline = time.monotonic() + self.deadline_seconds
+            remaining = max(0, min(self.deadline_seconds, request.deadline - time.time()))
+            deadline = time.monotonic() + remaining
             retry_at = time.monotonic() + 5
-            while time.monotonic() < deadline:
+            while time.monotonic() < deadline and time.time() < request.deadline:
                 result = self.receive(request)
                 if result is not None:
                     return result
@@ -240,22 +237,28 @@ class FileQueueExecutor:
             self.cancel(request.request_id)
             return _infra("Queue deadline exceeded; request cancelled.")
         except KeyboardInterrupt:
-            if request is not None:
-                try:
-                    self.cancel(request.request_id)
-                except (OSError, ValueError):
-                    pass
+            try:
+                self.cancel(request.request_id)
+            except (OSError, ValueError):
+                pass
             raise
         except (OSError, ValueError, TypeError):
-            if request is not None:
-                try:
-                    self.cancel(request.request_id)
-                except (OSError, ValueError):
-                    pass
+            try:
+                self.cancel(request.request_id)
+            except (OSError, ValueError):
+                pass
             return _infra("Queue transport or identity validation failed.")
         finally:
-            if request is not None:
-                self.pending.discard(request.request_id)
+            self.pending.discard(request.request_id)
+
+    def run(self, candidate: str, test_bundle_id: str) -> TestResult:
+        if not self.preflight()["passed"]:
+            return _infra("No single fresh compatible worker with successful Docker preflight.")
+        try:
+            request = self.submit(candidate, test_bundle_id)
+        except (OSError, ValueError, TypeError):
+            return _infra("Queue transport or identity validation failed.")
+        return self.wait(request)
 
 
 class QueueWorker:

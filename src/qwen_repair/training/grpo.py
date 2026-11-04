@@ -18,6 +18,7 @@ from .common import (
     record_executors, seal_training_run, file_hashes,
 )
 from .sft import bounded_feedback, bounded_text, verify_adapter_roundtrip
+from .validation import validate_authored
 
 
 def prompt_key(messages) -> str:
@@ -248,10 +249,7 @@ def run_grpo_smoke(config, output, executor, resume_from=None):
         fixtures = [load_fixture(name) for name in config.fixture_names]
         executors = [checked_executor(executor, fixture.task) for fixture in fixtures]
         record_executors(output, fixtures, executors)
-        for fixture, backend in zip(fixtures, executors, strict=True):
-            for bundle in (fixture.task.public_tests_ref, fixture.task.private_tests_ref):
-                if require_real_result(backend.run(fixture.reference_code, bundle)).status != "passed":
-                    raise ValueError("Authored GRPO reference must pass both trusted test bundles")
+        validate_authored(fixtures, executors, config, output, "grpo_fixed_two_turn", resume_from)
         model, tokenizer, dtype_name = load_base(config)
         model = PeftModel.from_pretrained(model, str(adapter), is_trainable=True)
         trainer, rollout = make_grpo_trainer(model, tokenizer, fixtures, executors, config, output, dtype_name)

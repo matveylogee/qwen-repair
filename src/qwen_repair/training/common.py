@@ -3,6 +3,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -137,6 +138,13 @@ def verify_checkpoint(directory: str | Path, config=None, *, allow_test_checkpoi
         if type(step) is not int or step < 1 or trainer_state.get("global_step") != step:
             raise ValueError("Checkpoint step does not match the saved trainer state")
     provenance = payload.get("provenance")
+    if isinstance(provenance, dict) and "authored_validation" in provenance:
+        cache_info = provenance["authored_validation"]
+        if not isinstance(cache_info, dict) or cache_info.get("file") != "authored_validation.json" or (
+            not isinstance(cache_info.get("sha256"), str)
+            or payload["files"].get("authored_validation.json") != cache_info["sha256"]
+        ):
+            raise ValueError("Checkpoint authored validation cache is missing or its hash changed")
     if not allow_test_checkpoint:
         required_provenance = {"source_hashes", "fixture_hashes", "versions", "executors"}
         if not isinstance(provenance, dict) or any(not provenance.get(key) for key in required_provenance):
@@ -249,6 +257,14 @@ def checkpoint_callback(config, *, allow_test_checkpoint=False):
             manifest_path = Path(args.output_dir) / "manifest.json"
             manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
             run_id = manifest.get("run_id")
+            cache_info = manifest.get("authored_validation")
+            if cache_info is not None:
+                cache_path = Path(args.output_dir) / "authored_validation.json"
+                if cache_info.get("file") != cache_path.name or hashlib.sha256(cache_path.read_bytes()).hexdigest() != cache_info.get("sha256"):
+                    raise ValueError("Authored validation cache changed before checkpoint creation")
+                shutil.copyfile(cache_path, directory / cache_path.name)
+            elif not allow_test_checkpoint:
+                raise ValueError("Production checkpoints require authored validation evidence")
             scaler_required = self.scaler_getter() if self.scaler_getter is not None else bool(args.fp16)
             atomic_json(directory / "checkpoint_complete.json", {
                 "schema_version": "1.0", "global_step": state.global_step,
@@ -257,7 +273,7 @@ def checkpoint_callback(config, *, allow_test_checkpoint=False):
                 "resolved_dtype": "float16" if args.fp16 else "bfloat16" if args.bf16 else "float32",
                 "optimizer_updates": self.summary(),
                 "provenance": {key: manifest[key] for key in (
-                    "source_hashes", "fixture_hashes", "versions", "initial_sft_adapter_hashes", "executors"
+                    "source_hashes", "fixture_hashes", "versions", "initial_sft_adapter_hashes", "executors", "authored_validation"
                 ) if key in manifest},
                 "config": config.model_dump(exclude={"stop_after_steps"}),
                 "files": file_hashes(directory),
@@ -353,6 +369,8 @@ def finish_run(config, output, trainer, started, dtype_name, **extra):
     segment_start_step = status["segment_start_step"]
     evidence = getattr(trainer, "repair_training_evidence", None)
     optimizer_updates = evidence.summary() if evidence is not None else None
+    manifest_path = output / "manifest.json"
+    validation_metrics = json.loads(manifest_path.read_text()).get("authored_validation_metrics") if manifest_path.exists() else None
     summary = {
         "schema_version": "1.0", "synthetic_demo": False,
         "status": "paused_at_checkpoint" if trainer.state.global_step < config.max_steps else "completed",
@@ -363,6 +381,7 @@ def finish_run(config, output, trainer, started, dtype_name, **extra):
         "trainer_steps_in_segment": trainer.state.global_step - segment_start_step,
         "optimizer_steps_in_segment": optimizer_updates["applied"] if optimizer_updates is not None else None,
         "optimizer_updates": optimizer_updates,
+        "authored_validation": validation_metrics,
         "duration_seconds": perf_counter() - started, "dtype": dtype_name,
         "peak_vram_bytes": torch.cuda.max_memory_allocated() if config.device == "cuda" else None,
         "training_log": [entry for entry in trainer.state.log_history if entry.get("step", -1) > segment_start_step], **extra,
