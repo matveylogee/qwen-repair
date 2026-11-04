@@ -37,7 +37,7 @@ def gpu_preflight() -> dict:
             return report
         device = torch.cuda.current_device()
         props = torch.cuda.get_device_properties(device)
-        bf16 = torch.cuda.is_bf16_supported()
+        bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
         dtype = torch.bfloat16 if bf16 else torch.float16
         report["gpu"].update({"device": device, "name": props.name,
                               "vram_bytes": props.total_memory,

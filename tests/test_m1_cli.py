@@ -1,7 +1,9 @@
 import importlib.metadata
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -24,6 +26,34 @@ def test_gpu_doctor_missing_dependencies_reports_failure_without_importing_torch
     assert report["checks"]["dependency_versions"] is False
     assert report["gpu"]["status"] == "torch_missing"
     assert report["synthetic_demo"] is False
+
+
+@pytest.mark.parametrize("native_bf16,expected_dtype", [(False, "float16"), (True, "bfloat16")])
+def test_gpu_doctor_suggests_only_native_dtype(monkeypatch, capsys, native_bf16, expected_dtype):
+    import qwen_repair.runtime as runtime
+
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_properties=lambda device: SimpleNamespace(
+                name="Simulated GPU", total_memory=16 * 1024**3,
+                major=8 if native_bf16 else 7, minor=0 if native_bf16 else 5,
+            ),
+            is_bf16_supported=lambda including_emulation=True: native_bf16 or including_emulation,
+            synchronize=lambda: None,
+        ),
+        version=SimpleNamespace(cuda="simulated"),
+        bfloat16="bfloat16", float16="float16",
+        ones=MagicMock(), all=lambda result: SimpleNamespace(item=lambda: True),
+    )
+    monkeypatch.setattr(runtime.importlib.metadata, "version", runtime.ML_VERSIONS.__getitem__)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    assert main(["doctor", "--gpu"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["gpu"]["bf16_supported"] is native_bf16
+    assert report["gpu"]["suggested_dtype"] == expected_dtype
+    torch.ones.assert_called_once_with((16, 16), device="cuda", dtype=expected_dtype)
 
 
 def test_m1_notebook_is_empty_valid_and_delegates_model_operations_to_cli():

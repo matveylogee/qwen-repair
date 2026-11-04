@@ -36,11 +36,11 @@ def device_dtype(config):
     selected = config.dtype
     if selected == "auto":
         selected = (
-            "bfloat16" if config.device == "cuda" and torch.cuda.is_bf16_supported()
+            "bfloat16" if config.device == "cuda" and torch.cuda.is_bf16_supported(including_emulation=False)
             else "float16" if config.device == "cuda" else "float32"
         )
-    if selected == "bfloat16" and config.device == "cuda" and not torch.cuda.is_bf16_supported():
-        raise RuntimeError("This GPU does not support the requested bfloat16 dtype")
+    if selected == "bfloat16" and config.device == "cuda" and not torch.cuda.is_bf16_supported(including_emulation=False):
+        raise RuntimeError("This GPU does not support native bfloat16 execution")
     if config.device == "cpu" and selected != "float32":
         raise ValueError("The bounded CPU training profile requires float32")
     return getattr(torch, selected), selected

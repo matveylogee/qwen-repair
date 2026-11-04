@@ -83,7 +83,7 @@ class TinyTorch:
     def __init__(self):
         self.seeds = []
         self.random = SimpleNamespace(fork_rng=lambda devices: nullcontext())
-        self.cuda = SimpleNamespace(is_available=lambda: False, is_bf16_supported=lambda: False)
+        self.cuda = SimpleNamespace(is_available=lambda: False, is_bf16_supported=lambda including_emulation=True: False)
 
     def manual_seed(self, seed):
         self.seeds.append(seed)
@@ -216,7 +216,13 @@ def test_real_controller_keeps_fixed_turns_and_exact_token_prefix():
     assert first.public_result.synthetic_demo is False
 
 
-def test_loader_pins_both_revisions_and_disables_remote_code(monkeypatch):
+@pytest.mark.parametrize("device,native_bf16,expected_dtype", [
+    ("cpu", False, "float32"),
+    ("cuda", False, "float16"),
+    ("cuda:0", False, "float16"),
+    ("cuda", True, "bfloat16"),
+])
+def test_loader_pins_both_revisions_and_disables_remote_code(monkeypatch, device, native_bf16, expected_dtype):
     tokenizer = TinyTokenizer()
     model = TinyModel([])
     calls = []
@@ -233,17 +239,33 @@ def test_loader_pins_both_revisions_and_disables_remote_code(monkeypatch):
             calls.append(("model", name, kwargs))
             return model
 
-    monkeypatch.setitem(sys.modules, "torch", TinyTorch())
+    torch = TinyTorch()
+    torch.cuda.is_available = lambda: True
+    torch.cuda.is_bf16_supported = lambda including_emulation=True: native_bf16 or including_emulation
+    monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
         AutoTokenizer=TokenizerFactory, AutoModelForCausalLM=ModelFactory,
     ))
-    policy = TransformersPolicy.from_pretrained(device="cpu")
+    policy = TransformersPolicy.from_pretrained(device=device)
     assert policy.tokenizer_revision == policy.model_revision == QWEN_REVISION
     assert len(calls) == 2
     for _, name, kwargs in calls:
         assert name == QWEN_MODEL_ID
         assert kwargs["revision"] == QWEN_REVISION
         assert kwargs["trust_remote_code"] is False
+    assert calls[1][2]["dtype"] == expected_dtype
+
+
+def test_loader_rejects_emulated_bfloat16_before_loading_model(monkeypatch):
+    torch = TinyTorch()
+    torch.cuda.is_available = lambda: True
+    torch.cuda.is_bf16_supported = lambda including_emulation=True: including_emulation
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
+        AutoTokenizer=None, AutoModelForCausalLM=None,
+    ))
+    with pytest.raises(RuntimeError, match="does not support.*bfloat16"):
+        TransformersPolicy.from_pretrained(device="cuda", dtype="bfloat16")
 
 
 def test_loader_rejects_unpinned_revisions_before_optional_imports():

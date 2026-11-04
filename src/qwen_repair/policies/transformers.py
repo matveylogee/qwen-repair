@@ -121,11 +121,11 @@ class TransformersPolicy:
         if device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("CUDA is unavailable; run GPU preflight in the selected runtime")
         if dtype == "auto":
-            dtype = ("bfloat16" if torch.cuda.is_bf16_supported() else "float16") if device.startswith("cuda") else "float32"
+            dtype = ("bfloat16" if torch.cuda.is_bf16_supported(including_emulation=False) else "float16") if device.startswith("cuda") else "float32"
         if dtype not in {"float32", "float16", "bfloat16"}:
             raise ValueError("dtype must be auto, float32, float16 or bfloat16")
-        if dtype == "bfloat16" and device.startswith("cuda") and not torch.cuda.is_bf16_supported():
-            raise RuntimeError("Selected GPU does not support the requested bfloat16 dtype")
+        if dtype == "bfloat16" and device.startswith("cuda") and not torch.cuda.is_bf16_supported(including_emulation=False):
+            raise RuntimeError("Selected GPU does not support native bfloat16 execution")
         tokenizer = AutoTokenizer.from_pretrained(
             model_id, revision=tokenizer_revision, trust_remote_code=False,
         )

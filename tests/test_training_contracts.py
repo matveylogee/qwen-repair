@@ -1,4 +1,5 @@
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -6,12 +7,32 @@ import pytest
 from qwen_repair.data.fixtures import load_fixture
 from qwen_repair.schemas import TestResult
 from qwen_repair.training.common import (
-    TrainingInfrastructureError, checked_executor, file_hashes, require_real_result,
+    TrainingInfrastructureError, checked_executor, device_dtype, file_hashes, require_real_result,
     verify_checkpoint,
 )
 from qwen_repair.training.config import GRPOConfig, SFTConfig
 from qwen_repair.training.grpo import MultiTurnRollout
 from qwen_repair.training.sft import build_sft_records, supervised_record
+
+
+@pytest.mark.parametrize("native_bf16,expected_dtype", [(False, "float16"), (True, "bfloat16")])
+def test_training_dtype_requires_native_bfloat16(monkeypatch, native_bf16, expected_dtype):
+    torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            is_bf16_supported=lambda including_emulation=True: native_bf16 or including_emulation,
+        ),
+        float32="float32", float16="float16", bfloat16="bfloat16",
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    assert device_dtype(SFTConfig()) == (expected_dtype, expected_dtype)
+    assert device_dtype(SFTConfig(dtype="float16")) == ("float16", "float16")
+    assert device_dtype(SFTConfig(device="cpu")) == ("float32", "float32")
+    if native_bf16:
+        assert device_dtype(SFTConfig(dtype="bfloat16")) == ("bfloat16", "bfloat16")
+    else:
+        with pytest.raises(RuntimeError, match="does not support.*bfloat16"):
+            device_dtype(SFTConfig(dtype="bfloat16"))
 
 
 class ToyTokenizer:
